@@ -5,6 +5,8 @@ import sqlite3
 import deribit
 import derive
 import protection
+import spreads
+from websockets.exceptions import WebSocketException
 import time
 from contextlib import closing
 from decimal import Decimal, InvalidOperation
@@ -394,7 +396,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
-        if self.path not in ('/api/position', '/api/scenario', '/api/funds', '/api/repay', '/api/liquidation', '/api/recovery', '/api/deribit/quote', '/api/derive/quote', '/api/protection'):
+        if self.path not in ('/api/position', '/api/scenario', '/api/funds', '/api/repay', '/api/liquidation', '/api/recovery', '/api/deribit/quote', '/api/derive/quote', '/api/protection', '/api/spreads/scan', '/api/spreads/preview'):
             self.send_error(404)
             return
         try:
@@ -412,6 +414,10 @@ class Handler(BaseHTTPRequestHandler):
                 result = simulate_liquidation(data)
             elif self.path == '/api/recovery':
                 result = recovery(data)
+            elif self.path == '/api/spreads/scan':
+                result = spreads.scan(data['venue'], data['expiry'], data['direction'], data['entry'], data['size'])
+            elif self.path == '/api/spreads/preview':
+                result = spreads.preview(data['venue'], data['direction'], data['entry'], data['buy'], data['sell'], data['size'])
             elif self.path == '/api/protection':
                 result = compare_protection(data)
             elif self.path == '/api/derive/quote':
@@ -422,7 +428,7 @@ class Handler(BaseHTTPRequestHandler):
                 save(data)
                 result = load()
             self.respond(200, json.dumps(result).encode(), 'application/json')
-        except (ValueError, TypeError, KeyError, OSError, TimeoutError, json.JSONDecodeError) as exc:
+        except (ValueError, TypeError, KeyError, OSError, TimeoutError, WebSocketException, json.JSONDecodeError) as exc:
             self.respond(400, json.dumps({'error': str(exc)}).encode(), 'application/json')
 
     def respond(self, status, body, content_type):
