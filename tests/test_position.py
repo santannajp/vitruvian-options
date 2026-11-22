@@ -145,3 +145,13 @@ class RecoveryTest(unittest.TestCase):
             position['collateral'][0]['quantity'] = '2'
             app.scenario(position, True)
             self.assertEqual(app.recovery(identity=('a', 'ethereum', 'aave'))['target_btc'], '1.2')
+
+class RollMarketTest(unittest.TestCase):
+    def test_browser_cannot_override_live_index_or_days_remaining(self):
+        quote={'venue':'derive','expiry':1800000000000}
+        position={'request_id':'trade','quote':quote}
+        payload={'request_id':'trade','reference_price':'1','days_remaining':'999'}
+        with patch.object(app.paper,'list_spreads',return_value=[position]), patch.object(app.spreads,'reference_index',return_value=105000), patch.object(app.time,'time',return_value=1799999999):
+            app._enrich_roll_market(payload)
+        self.assertEqual(payload['reference_price'],'105000')
+        self.assertLess(float(payload['days_remaining']),0.001)

@@ -415,7 +415,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
-        if self.path not in ('/api/position', '/api/scenario', '/api/funds', '/api/repay', '/api/liquidation', '/api/recovery', '/api/deribit/quote', '/api/derive/quote', '/api/protection', '/api/spreads/scan', '/api/spreads/preview', '/api/paper/open', '/api/paper/fill', '/api/paper/close', '/api/radar/score', '/api/audit/disposition', '/api/audit/cashflow'):
+        if self.path not in ('/api/position', '/api/scenario', '/api/funds', '/api/repay', '/api/liquidation', '/api/recovery', '/api/deribit/quote', '/api/derive/quote', '/api/protection', '/api/spreads/scan', '/api/spreads/preview', '/api/paper/open', '/api/paper/fill', '/api/paper/close', '/api/radar/score', '/api/audit/disposition', '/api/audit/cashflow', '/api/paper/roll-rule', '/api/paper/roll/preview', '/api/paper/roll'):
             self.send_error(404)
             return
         try:
@@ -450,6 +450,14 @@ class Handler(BaseHTTPRequestHandler):
                 result = audit.disposition(DB, data)
             elif self.path == '/api/audit/cashflow':
                 result = audit.cashflow(DB, data)
+            elif self.path == '/api/paper/roll-rule':
+                result = paper.save_roll_rule(DB, data)
+            elif self.path == '/api/paper/roll/preview':
+                _enrich_roll_market(data)
+                result = paper.preview_roll(DB, data)
+            elif self.path == '/api/paper/roll':
+                _enrich_roll_market(data)
+                result = paper.execute_roll(DB, data)
             elif self.path == '/api/protection':
                 result = compare_protection(data)
             elif self.path == '/api/derive/quote':
@@ -469,6 +477,16 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+
+def _enrich_roll_market(data):
+    """Never let the browser choose its own live roll trigger observation."""
+    positions=paper.list_spreads(DB)
+    position=next((x for x in positions if x['request_id']==str(data.get('request_id',''))),None)
+    if not position:
+        raise ValueError('Posição simulada não encontrada.')
+    data['reference_price']=str(spreads.reference_index(position['quote']['venue']))
+    data['days_remaining']=str(max(0,(int(position['quote']['expiry'])-time.time()*1000)/86400000))
 
 
 if __name__ == '__main__':

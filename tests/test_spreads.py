@@ -61,3 +61,15 @@ class SpreadTest(unittest.TestCase):
             self.assertEqual(result['sell_long_bid'],'4')
             self.assertEqual(result['buy_short_ask'],'5')
             self.assertEqual(result['close_debit'],'1')
+
+    def test_roll_credit_145_less_120_and_eight_fees_is_17(self):
+        def snapshot(venue,name):
+            return {'name':name,'type':'put','strike':'100','expiry':1000,'minimum':'1','step':'1','maximum':'10',
+                    'bids':[['145','10']] if name=='NEW' else [['130','10']],
+                    'asks':[['120','10']] if name=='OLD' else [['155','10']],
+                    'index':'100000','timestamp':1800000000000,'rate':'0','base_fee':'4','fee_cap':'0.125'}
+        result=spreads.roll_quote('derive','OLD','NEW','sell','1',snapshot)
+        self.assertEqual(result['old_close_price'],'120')
+        self.assertEqual(result['replacement_price'],'145')
+        self.assertEqual(result['fees'],'8')
+        self.assertEqual(result['net_credit'],'17')

@@ -93,6 +93,42 @@ class PaperTest(unittest.TestCase):
         self.assertEqual(settled['exit_quote']['intrinsic_usd'],'5')
         self.assertEqual(settled['realized_pnl'],'3.85')
 
+    def test_roll_rules_block_credit_20_allow_17_and_replay_once(self):
+        paper.open_spread(self.db,self.request,preview)
+        rule={'request_id':'one','side':'sell','trigger':'days_lte','threshold':'5',
+              'minimum_credit':'20','max_rolls':1,'max_capital_usd':'1000','max_cumulative_loss_usd':'50'}
+        paper.save_roll_rule(self.db,rule)
+        data={'request_id':'one','new_instrument':'BTC-C120','reference_price':'105','days_remaining':'4'}
+        def roll_quote(venue,old,new,side,size):
+            return {'old_instrument':old,'new_instrument':new,'side':side,'size':size,
+                    'old_close_price':'120','replacement_price':'145','fees':'8','net_debit':'-17',
+                    'net_credit':'17','currency':'USDC','reference_btc_usd':'100000','timestamp':1800000000000,
+                    'new_strike':'120','new_expiry':1800000000000,'type':'call'}
+        blocked=paper.preview_roll(self.db,data,roll_quote)
+        self.assertFalse(blocked['eligible'])
+        self.assertIn('abaixo do mínimo',blocked['reasons'][0])
+        rule['minimum_credit']='17';paper.save_roll_rule(self.db,rule)
+        allowed=paper.preview_roll(self.db,data,roll_quote)
+        self.assertTrue(allowed['eligible'])
+        first=paper.execute_roll(self.db,{**data,'event_id':'roll-1'},roll_quote)
+        second=paper.execute_roll(self.db,{**data,'event_id':'roll-1'},lambda *args:self.fail('replay must not reroll'))
+        self.assertEqual(first,second)
+        self.assertEqual(first['status'],'executada')
+        self.assertEqual(first['net_credit'],'17')
+        self.assertEqual(first['position']['quote']['sell'],'BTC-C120')
+        self.assertEqual(first['position']['roll_count'],1)
+        self.assertEqual(paper.list_spreads(self.db)[0]['last_roll']['quote']['net_credit'],'17')
+
+    def test_roll_blocks_partially_filled_exposure(self):
+        paper.open_spread(self.db,self.request,preview)
+        paper.save_roll_rule(self.db,{'request_id':'one','side':'sell','trigger':'days_lte','threshold':'5',
+            'minimum_credit':'0','max_rolls':1,'max_capital_usd':'1000','max_cumulative_loss_usd':'50'})
+        paper.record_fill(self.db,{'strategy_id':'one','event_id':'partial','instrument':'BTC-C100',
+            'observed_at':'2026-01-01T00:00:00Z','quantity':'0.5','average_price':'2','fee':'0'})
+        with self.assertRaisesRegex(ValueError,'preenchimento parcial'):
+            paper.preview_roll(self.db,{'request_id':'one','new_instrument':'BTC-C120','reference_price':'100',
+                'days_remaining':'1'},lambda *args:self.fail('must block before fetching roll book'))
+
 
 if __name__ == '__main__':
     unittest.main()

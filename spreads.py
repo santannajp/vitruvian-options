@@ -189,3 +189,44 @@ def close_quote(venue, buy_name, sell_name, size, fetch_snapshot=snapshot):
             'sell_long_bid':str(bid),'buy_short_ask':str(ask),'fees':str(fee),'currency':'BTC' if venue=='deribit' else 'USDC',
             'reference_btc_usd':str(index),'timestamp':min(buy['timestamp'],sell['timestamp']),
             'timestamp_buy':sell['timestamp'],'timestamp_sell':buy['timestamp']}
+
+
+def roll_quote(venue, old_name, new_name, side, size, fetch_snapshot=snapshot):
+    """Buy back/sell the old leg and open its replacement at executable book sides."""
+    if side not in ('buy','sell'):raise ValueError('Lado da perna inválido.')
+    amount=decimal(size);old,new=fetch_snapshot(venue,old_name),fetch_snapshot(venue,new_name)
+    if time.time()*1000-min(old['timestamp'],new['timestamp'])>30000:raise ValueError('Livro desatualizado; rolagem suspensa.')
+    if old['type']!=new['type'] or old['expiry']!=new['expiry']:
+        raise ValueError('Rolagem inicial exige tipo e vencimento iguais; calendários ficam para a etapa própria.')
+    if old_name==new_name:raise ValueError('Instrumento substituto deve ser diferente da perna atual.')
+    if any(amount<decimal(x['minimum']) or amount%decimal(x['step']) or (x['maximum'] and amount>decimal(x['maximum'])) for x in (old,new)):
+        raise ValueError('Quantidade fora dos limites de lote da rolagem.')
+    close_levels=old['asks'] if side=='sell' else old['bids']
+    open_levels=new['bids'] if side=='sell' else new['asks']
+    if not close_levels or not open_levels:raise ValueError('Falta oferta para uma das pernas da rolagem.')
+    close_price,close_qty=map(decimal,close_levels[0]);open_price,open_qty=map(decimal,open_levels[0])
+    if min(close_qty,open_qty)<amount:raise ValueError('Profundidade insuficiente para rolar a quantidade completa.')
+    index=decimal(old['index'])
+    if venue=='deribit':
+        fees=amount*(min(decimal(old['rate']),close_price*decimal(old['fee_cap']))+min(decimal(new['rate']),open_price*decimal(new['fee_cap'])))
+    elif venue=='derive':
+        fees=decimal(old['base_fee'])+min(decimal(old['rate'])*amount*index,close_price*amount*decimal(old['fee_cap']))
+        fees+=decimal(new['base_fee'])+min(decimal(new['rate'])*amount*index,open_price*amount*decimal(new['fee_cap']))
+    else:raise ValueError('Exchange inválida.')
+    if side=='sell':debit=(close_price-open_price)*amount+fees
+    else:debit=(open_price-close_price)*amount+fees
+    return {'old_instrument':old_name,'new_instrument':new_name,'side':side,'size':str(amount),
+            'old_close_price':str(close_price),'replacement_price':str(open_price),'fees':str(fees),
+            'net_debit':str(debit),'net_credit':str(-debit),'currency':'BTC' if venue=='deribit' else 'USDC',
+            'new_strike':str(new['strike']),'new_expiry':new['expiry'],'type':new['type'],
+            'reference_btc_usd':str(index),'timestamp':min(old['timestamp'],new['timestamp']),
+            'old_timestamp':old['timestamp'],'replacement_timestamp':new['timestamp']}
+
+
+def reference_index(venue):
+    """Read BTC/USD trigger reference from the selected public venue."""
+    if venue=='deribit':
+        return decimal(deribit.request('get_index_price',{'index_name':'btc_usd'})['index_price'])
+    if venue=='derive':
+        return decimal(derive.request('get_currency',{'currency':'BTC'})['spot_price'])
+    raise ValueError('Exchange inválida.')

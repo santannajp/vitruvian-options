@@ -218,7 +218,7 @@ def close_spread(db_path, request_id, event_id, close=spreads.close_quote, settl
                         'settlement_price_btc_usd':str(settlement_price),'intrinsic_usd':str(intrinsic_usd),
                         'model':'intrínseco estimado; não substitui conciliação oficial da exchange'}
             close_mode='vencimento'
-        pnl=-_d(quote['debit'])-_d(exit_quote['close_debit'])
+        pnl=-_d(quote['debit'])-_d(exit_quote['close_debit'])+_d(opened.get('net_roll_credits','0'))
         currency=quote['entry_currency']
         usd_pnl=pnl*_d(exit_quote['reference_btc_usd']) if currency=='BTC' else pnl
         with closing(sqlite3.connect(db_path,timeout=10)) as con,con:
@@ -256,10 +256,124 @@ def monitor(db_path, close=spreads.close_quote):
         quote=position['quote']
         try:
             exit_quote=close(quote['venue'],quote['buy'],quote['sell'],quote['size'])
-            pnl=-_d(quote['debit'])-_d(exit_quote['close_debit'])
+            pnl=-_d(quote['debit'])-_d(exit_quote['close_debit'])+_d(position.get('net_roll_credits','0'))
             usd=pnl*_d(exit_quote['reference_btc_usd']) if quote['entry_currency']=='BTC' else pnl
             results.append({**position,'market_status':'atualizada','exit_quote':exit_quote,'unrealized_pnl':str(pnl),
                             'unrealized_currency':quote['entry_currency'],'unrealized_pnl_usd':str(usd)})
         except (ValueError,OSError,TimeoutError,derive.WebSocketException) as exc:
             results.append({**position,'market_status':'indisponivel','market_error':str(exc)})
     return results
+
+
+def save_roll_rule(db_path,data):
+    try:
+        strategy=str(data['request_id']).strip();side=str(data['side']);trigger=str(data['trigger'])
+        threshold=_d(data['threshold']);minimum=_d(data['minimum_credit'])
+        max_rolls=int(data['max_rolls']);capital=_d(data['max_capital_usd']);loss_limit=_d(data['max_cumulative_loss_usd'])
+        if side not in ('buy','sell') or trigger not in ('price_below','price_above','days_lte') or threshold<0 or minimum<0 or max_rolls<0 or capital<0 or loss_limit<0:
+            raise ValueError('Regra ou limites de rolagem inválidos.')
+        rule={'version':'roll-v1','side':side,'trigger':trigger,'threshold':str(threshold),
+              'minimum_credit':str(minimum),'max_rolls':max_rolls,'max_capital_usd':str(capital),
+              'max_cumulative_loss_usd':str(loss_limit),'updated_at':str(time.time()*1000)}
+        with closing(sqlite3.connect(db_path,timeout=10)) as con,con:
+            con.execute('CREATE TABLE IF NOT EXISTS paper_roll_rules (request_id TEXT PRIMARY KEY,payload TEXT NOT NULL)')
+            if not con.execute('SELECT 1 FROM paper_spreads WHERE request_id=?',(strategy,)).fetchone():raise ValueError('Posição simulada não encontrada.')
+            con.execute('INSERT OR REPLACE INTO paper_roll_rules VALUES(?,?)',(strategy,json.dumps(rule)))
+        return {'request_id':strategy,'rule':rule}
+    except (KeyError,TypeError,InvalidOperation,ValueError,sqlite3.OperationalError) as exc:
+        if isinstance(exc,ValueError):raise
+        raise ValueError('Dados de regra de rolagem inválidos.') from exc
+
+
+def preview_roll(db_path,data,quote_fn=spreads.roll_quote):
+    try:
+        strategy=str(data['request_id']).strip();new_name=str(data['new_instrument']).strip()
+        with closing(sqlite3.connect(db_path)) as con:
+            row=con.execute('SELECT payload FROM paper_spreads WHERE request_id=?',(strategy,)).fetchone()
+            rule_row=con.execute('SELECT payload FROM paper_roll_rules WHERE request_id=?',(strategy,)).fetchone()
+            try:events=con.execute('SELECT payload FROM paper_roll_events WHERE request_id=?',(strategy,)).fetchall()
+            except sqlite3.OperationalError:events=[]
+        if not row:raise ValueError('Posição simulada não encontrada.')
+        position=reconciled(db_path,json.loads(row[0]))
+        if position['status']!='aberta':raise ValueError('Somente posições abertas podem ser roladas.')
+        if position.get('roll_blocked'):raise ValueError('Reconcilie o preenchimento parcial antes de rolar.')
+        rule=json.loads(rule_row[0]) if rule_row else data.get('rule')
+        if not rule:raise ValueError('Salve uma regra de rolagem antes da prévia.')
+        side=rule['side'];old_name=position['quote']['buy'] if side=='buy' else position['quote']['sell']
+        observed_price=_d(data.get('reference_price','0'));days=_d(data.get('days_remaining','0'))
+        threshold=_d(rule['threshold'])
+        triggered=(observed_price<=threshold if rule['trigger']=='price_below' else observed_price>=threshold if rule['trigger']=='price_above' else days<=threshold)
+        reasons=[]
+        if not triggered:reasons.append('Gatilho de preço/prazo ainda não atingido.')
+        if len(events)>=int(rule['max_rolls']):reasons.append('Limite máximo de rolagens atingido.')
+        quote=quote_fn(position['quote']['venue'],old_name,new_name,side,position['quote']['size'])
+        credit=_d(quote['net_credit']);currency=quote['currency']
+        if credit<_d(rule['minimum_credit']):reasons.append(f'Crédito líquido {credit} {currency} abaixo do mínimo {_d(rule["minimum_credit"])} {currency}.')
+        fx=_d(quote['reference_btc_usd']) if currency=='BTC' else Decimal(1)
+        capital=_d(position['reserved'])*fx+max(Decimal(0),-credit)*fx
+        if capital>_d(rule['max_capital_usd']):reasons.append(f'Capital estimado {capital} USD excede o limite {_d(rule["max_capital_usd"])} USD.')
+        cumulative=sum((max(Decimal(0),-_d(json.loads(event[0])['quote']['net_credit'])*_d(json.loads(event[0])['quote']['reference_btc_usd']) if currency=='BTC' else Decimal(0)) for event in events),Decimal(0))
+        cumulative=Decimal(0)
+        for event in events:
+            previous_quote=json.loads(event[0])['quote']
+            previous_fx=_d(previous_quote['reference_btc_usd']) if previous_quote['currency']=='BTC' else Decimal(1)
+            cumulative+=max(Decimal(0),-_d(previous_quote['net_credit'])*previous_fx)
+        new_loss=cumulative+max(Decimal(0),-credit*fx)
+        if new_loss>_d(rule['max_cumulative_loss_usd']):reasons.append(f'Perda acumulada estimada {new_loss} USD excede {_d(rule["max_cumulative_loss_usd"])} USD.')
+        return {'eligible':not reasons,'reasons':reasons,'triggered':triggered,'observed_price':str(observed_price),
+                'days_remaining':str(days),'rule':rule,'roll_count':len(events),'quote':quote,
+                'capital_usd':str(capital),'cumulative_roll_loss_usd':str(new_loss),
+                'before':{'buy':position['quote']['buy'],'sell':position['quote']['sell'],'reserved':position['reserved']},
+                'after':{'buy':new_name if side=='buy' else position['quote']['buy'],
+                         'sell':new_name if side=='sell' else position['quote']['sell']}}
+    except (KeyError,TypeError,InvalidOperation,sqlite3.OperationalError) as exc:
+        raise ValueError('Dados para avaliar rolagem inválidos.') from exc
+
+
+def execute_roll(db_path,data,quote_fn=spreads.roll_quote):
+    event_id=str(data.get('event_id') or uuid.uuid4()).strip();strategy=str(data.get('request_id','')).strip()
+    signature=json.dumps({k:v for k,v in data.items() if k not in ('event_id','reference_price','days_remaining')},sort_keys=True)
+    with closing(sqlite3.connect(db_path)) as con:
+        try:old=con.execute('SELECT signature,payload FROM paper_roll_events WHERE event_id=?',(event_id,)).fetchone()
+        except sqlite3.OperationalError:old=None
+    if old:
+        if old[0]!=signature:raise ValueError('ID do evento de rolagem reutilizado com dados diferentes.')
+        return json.loads(old[1])
+    evaluation=preview_roll(db_path,data,quote_fn)
+    if not evaluation['eligible']:return {'status':'bloqueada',**evaluation}
+    quote=evaluation['quote'];currency=quote['currency'];credit=_d(quote['net_credit'])
+    with closing(sqlite3.connect(db_path,timeout=10)) as con,con:
+        con.execute('BEGIN IMMEDIATE')
+        con.execute('CREATE TABLE IF NOT EXISTS paper_roll_events (event_id TEXT PRIMARY KEY,request_id TEXT NOT NULL,signature TEXT NOT NULL,payload TEXT NOT NULL)')
+        prior=con.execute('SELECT signature,payload FROM paper_roll_events WHERE event_id=?',(event_id,)).fetchone()
+        if prior:
+            if prior[0]!=signature:raise ValueError('ID do evento de rolagem reutilizado com dados diferentes.')
+            return json.loads(prior[1])
+        row=con.execute('SELECT payload FROM paper_spreads WHERE request_id=?',(strategy,)).fetchone()
+        wallet_row=con.execute('SELECT payload FROM funds WHERE id=1').fetchone()
+        if not row or not wallet_row:raise ValueError('Posição ou saldo não encontrado.')
+        position=json.loads(row[0]);wallet=json.loads(wallet_row[0]);token=position['reserved_token'];venue=position['quote']['venue']
+        balance=next((x for x in wallet['balances'] if x['token'].upper()==token.upper() and x['location'].lower()==venue.lower()),None)
+        if not balance:raise ValueError('Saldo da exchange não cadastrado.')
+        available=_d(balance['available']);total=_d(balance['total'])
+        if credit<0 and -credit>available:raise ValueError('Saldo livre insuficiente para pagar a rolagem.')
+        balance['total']=str(total+credit);balance['available']=str(available+credit)
+        side=evaluation['rule']['side'];new_name=quote['new_instrument'];old_name=quote['old_instrument']
+        position['quote'][side]=new_name
+        position['quote'][side+'_strike']=quote['new_strike']
+        position['quote'][side+'_expiry']=quote['new_expiry']
+        position['net_roll_credits']=str(_d(position.get('net_roll_credits','0'))+credit)
+        position['roll_count']=int(position.get('roll_count',0))+1
+        position['roll_rules']=evaluation['rule']
+        position['last_roll']={'event_id':event_id,'quote':quote,'trigger':evaluation['rule']['trigger'],
+                               'reference_price':evaluation['observed_price'],'days_remaining':evaluation['days_remaining'],
+                               'reason':str(data.get('reason','gatilho automático da regra')),'before':evaluation['before'],'after':evaluation['after']}
+        position['wallet']=wallet
+        payload={'status':'executada','event_id':event_id,'request_id':strategy,'quote':quote,
+                 'rule':evaluation['rule'],'before':evaluation['before'],'after':evaluation['after'],
+                 'net_credit':str(credit),'cumulative_roll_loss_usd':evaluation['cumulative_roll_loss_usd'],
+                 'reason':position['last_roll']['reason'],'position':position}
+        con.execute('UPDATE funds SET payload=? WHERE id=1',(json.dumps(wallet),))
+        con.execute('UPDATE paper_spreads SET payload=? WHERE request_id=?',(json.dumps(position),strategy))
+        con.execute('INSERT INTO paper_roll_events VALUES(?,?,?,?)',(event_id,strategy,signature,json.dumps(payload)))
+        return payload
