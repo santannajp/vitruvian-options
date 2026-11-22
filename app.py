@@ -421,7 +421,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
-        if self.path not in ('/api/position', '/api/scenario', '/api/funds', '/api/repay', '/api/liquidation', '/api/recovery', '/api/deribit/quote', '/api/derive/quote', '/api/protection', '/api/spreads/scan', '/api/spreads/preview', '/api/paper/open', '/api/paper/fill', '/api/paper/close', '/api/radar/score', '/api/audit/disposition', '/api/audit/cashflow', '/api/paper/roll-rule', '/api/paper/roll/preview', '/api/paper/roll', '/api/perp/position', '/api/perp/hedge', '/api/structures/preview', '/api/structures/open', '/api/structures/fill', '/api/structures/close', '/api/structures/settle'):
+        if self.path not in ('/api/position', '/api/scenario', '/api/funds', '/api/repay', '/api/liquidation', '/api/recovery', '/api/deribit/quote', '/api/derive/quote', '/api/protection', '/api/spreads/scan', '/api/spreads/preview', '/api/paper/open', '/api/paper/fill', '/api/paper/close', '/api/radar/score', '/api/audit/disposition', '/api/audit/cashflow', '/api/paper/roll-rule', '/api/paper/roll/preview', '/api/paper/roll', '/api/perp/position', '/api/perp/hedge', '/api/structures/preview', '/api/structures/open', '/api/structures/fill', '/api/structures/close', '/api/structures/settle', '/api/structures/settle-leg'):
             self.send_error(404)
             return
         try:
@@ -478,6 +478,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = option_structures.close_paper(DB, data['request_id'], data['event_id'])
             elif self.path == '/api/structures/settle':
                 result = option_structures.settle_paper(DB, data['request_id'], data['event_id'], data['btc_price'], data.get('fee','0'))
+            elif self.path == '/api/structures/settle-leg':
+                result = option_structures.settle_leg(DB, data['request_id'], data['event_id'], data['instrument'], data['btc_price'], data.get('fee','0'))
             elif self.path == '/api/protection':
                 result = compare_protection(data)
             elif self.path == '/api/derive/quote':
