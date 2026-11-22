@@ -20,7 +20,7 @@ def universe(venue, expiry, fetch_deribit=deribit.request, fetch_derive=derive.r
         return [{'name': item['instrument_name'], 'strike': str(item['strike']), 'expiry': item['expiration_timestamp'],
                  'type': item['option_type'], 'minimum': str(item['min_trade_amount'])}
                 for item in instruments if item.get('is_active') and item.get('settlement_currency') == 'BTC'
-                and time.strftime('%Y-%m-%d', time.gmtime(item['expiration_timestamp'] / 1000)) == expiry]
+                and (expiry == '*' or time.strftime('%Y-%m-%d', time.gmtime(item['expiration_timestamp'] / 1000)) == expiry)]
     if venue == 'derive':
         result = []
         page = 1
@@ -28,7 +28,7 @@ def universe(venue, expiry, fetch_deribit=deribit.request, fetch_derive=derive.r
             data = fetch_derive('get_all_instruments', {'instrument_type': 'option', 'currency': 'BTC', 'expired': False, 'page': page, 'page_size': 1000})
             for item in data['instruments']:
                 details = item.get('option_details') or {}
-                if item.get('is_active') and time.strftime('%Y-%m-%d', time.gmtime(details['expiry'])) == expiry:
+                if item.get('is_active') and (expiry == '*' or time.strftime('%Y-%m-%d', time.gmtime(details['expiry'])) == expiry):
                     result.append({'name': item['instrument_name'], 'strike': details['strike'], 'expiry': details['expiry'] * 1000,
                                    'type': 'put' if details['option_type'] == 'P' else 'call', 'minimum': item['minimum_amount']})
             if page >= data['pagination']['num_pages']:

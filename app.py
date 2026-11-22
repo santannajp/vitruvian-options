@@ -9,6 +9,7 @@ import spreads
 import paper
 import radar
 import audit
+import perp
 from websockets.exceptions import WebSocketException
 import time
 from contextlib import closing
@@ -409,13 +410,15 @@ class Handler(BaseHTTPRequestHandler):
                 try: result['aave_recovery'].append({'identity':identity, **recovery(identity=identity)})
                 except ValueError: pass
             self.respond(200, json.dumps(result).encode(), 'application/json')
+        elif self.path == '/api/perp':
+            self.respond(200, json.dumps({'positions':perp.positions(DB),'hedges':perp.hedge_history(DB)}).encode(), 'application/json')
         elif self.path == '/':
             self.respond(200, Path(__file__).with_name('index.html').read_bytes(), 'text/html; charset=utf-8')
         else:
             self.send_error(404)
 
     def do_POST(self):
-        if self.path not in ('/api/position', '/api/scenario', '/api/funds', '/api/repay', '/api/liquidation', '/api/recovery', '/api/deribit/quote', '/api/derive/quote', '/api/protection', '/api/spreads/scan', '/api/spreads/preview', '/api/paper/open', '/api/paper/fill', '/api/paper/close', '/api/radar/score', '/api/audit/disposition', '/api/audit/cashflow', '/api/paper/roll-rule', '/api/paper/roll/preview', '/api/paper/roll'):
+        if self.path not in ('/api/position', '/api/scenario', '/api/funds', '/api/repay', '/api/liquidation', '/api/recovery', '/api/deribit/quote', '/api/derive/quote', '/api/protection', '/api/spreads/scan', '/api/spreads/preview', '/api/paper/open', '/api/paper/fill', '/api/paper/close', '/api/radar/score', '/api/audit/disposition', '/api/audit/cashflow', '/api/paper/roll-rule', '/api/paper/roll/preview', '/api/paper/roll', '/api/perp/position', '/api/perp/hedge'):
             self.send_error(404)
             return
         try:
@@ -458,6 +461,10 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == '/api/paper/roll':
                 _enrich_roll_market(data)
                 result = paper.execute_roll(DB, data)
+            elif self.path == '/api/perp/position':
+                result = perp.save_position(DB, data)
+            elif self.path == '/api/perp/hedge':
+                result = perp.hedge(DB, data)
             elif self.path == '/api/protection':
                 result = compare_protection(data)
             elif self.path == '/api/derive/quote':
