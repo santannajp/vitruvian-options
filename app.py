@@ -4,6 +4,8 @@ import os
 import sqlite3
 import deribit
 import derive
+import protection
+import time
 from contextlib import closing
 from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -325,6 +327,40 @@ def recovery(data=None, identity=None):
             'deficit_btc': str(max(Decimal(0), target - observed - purchased)), 'remaining_debt_usd': debt}
 
 
+def compare_protection(data):
+    liquidation = simulate_liquidation(data['liquidation'])
+    if liquidation['event'] == 'sem_liquidacao':
+        raise ValueError('O cenário Aave informado não produz liquidação.')
+    quotes = protection.deribit_inputs(data['long_name'], data['short_name'], deribit.request, time.time)
+    inputs = {**data, **quotes,
+              'protected_btc': liquidation['protected_btc'],
+              'remaining_btc': liquidation['remaining_btc'],
+              'cash_btc': liquidation['cash_btc'],
+              'extra_cost_btc': str(data['liquidation']['costs_btc'])}
+    if Decimal(str(data['days_remaining'])) * Decimal(86400000) > Decimal(quotes['expiration'] - quotes['timestamp']):
+        raise ValueError('O prazo restante excede a duração do contrato selecionado.')
+    result = protection.compare(inputs)
+    for item in result['strategies']:
+        long_close = quotes['long_close']
+        short_close = quotes['short_close'] if item['name'] == 'trava' else None
+        amount = Decimal(item['amount'])
+        if long_close and (item['name'] == 'put' or short_close):
+            available = min(amount, Decimal(str(long_close[1])))
+            if short_close:
+                available = min(available, Decimal(str(short_close[1])))
+            price = Decimal(str(long_close[0])) - (Decimal(str(short_close[0])) if short_close else 0)
+            exit_fee = Decimal(quotes['fee_btc_per_contract']) * (2 if short_close else 1)
+            entry_per_unit = Decimal(item['premium_btc']) / amount if amount else Decimal(0)
+            item['current_close'] = {'amount': str(available), 'unfilled': str(amount - available),
+                                     'net_btc': str(available * (price - exit_fee - entry_per_unit))}
+        else:
+            item['current_close'] = None
+    result['quotes'] = quotes
+    result['health_factor'] = liquidation['health_factor_before']
+    result['liquidation'] = liquidation
+    return result
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/api/position':
@@ -358,7 +394,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
-        if self.path not in ('/api/position', '/api/scenario', '/api/funds', '/api/repay', '/api/liquidation', '/api/recovery', '/api/deribit/quote', '/api/derive/quote'):
+        if self.path not in ('/api/position', '/api/scenario', '/api/funds', '/api/repay', '/api/liquidation', '/api/recovery', '/api/deribit/quote', '/api/derive/quote', '/api/protection'):
             self.send_error(404)
             return
         try:
@@ -376,6 +412,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = simulate_liquidation(data)
             elif self.path == '/api/recovery':
                 result = recovery(data)
+            elif self.path == '/api/protection':
+                result = compare_protection(data)
             elif self.path == '/api/derive/quote':
                 result = derive.quote(data['instrument'], data['size'])
             elif self.path == '/api/deribit/quote':
