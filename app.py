@@ -6,6 +6,7 @@ import deribit
 import derive
 import protection
 import spreads
+import paper
 from websockets.exceptions import WebSocketException
 import time
 from contextlib import closing
@@ -390,13 +391,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(503, json.dumps({'error': str(exc)}).encode(), 'application/json')
         elif self.path == '/api/funds':
             self.respond(200, json.dumps(funds()).encode(), 'application/json')
+        elif self.path == '/api/paper':
+            self.respond(200, json.dumps(paper.list_spreads(DB)).encode(), 'application/json')
         elif self.path == '/':
             self.respond(200, Path(__file__).with_name('index.html').read_bytes(), 'text/html; charset=utf-8')
         else:
             self.send_error(404)
 
     def do_POST(self):
-        if self.path not in ('/api/position', '/api/scenario', '/api/funds', '/api/repay', '/api/liquidation', '/api/recovery', '/api/deribit/quote', '/api/derive/quote', '/api/protection', '/api/spreads/scan', '/api/spreads/preview'):
+        if self.path not in ('/api/position', '/api/scenario', '/api/funds', '/api/repay', '/api/liquidation', '/api/recovery', '/api/deribit/quote', '/api/derive/quote', '/api/protection', '/api/spreads/scan', '/api/spreads/preview', '/api/paper/open'):
             self.send_error(404)
             return
         try:
@@ -418,6 +421,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = spreads.scan(data['venue'], data['expiry'], data['direction'], data['entry'], data['size'])
             elif self.path == '/api/spreads/preview':
                 result = spreads.preview(data['venue'], data['direction'], data['entry'], data['buy'], data['sell'], data['size'])
+            elif self.path == '/api/paper/open':
+                result = paper.open_spread(DB, data)
             elif self.path == '/api/protection':
                 result = compare_protection(data)
             elif self.path == '/api/derive/quote':
