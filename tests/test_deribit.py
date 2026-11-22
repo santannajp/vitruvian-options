@@ -9,7 +9,7 @@ class DeribitTest(unittest.TestCase):
         book = {'bids': [[0.02, 0.1], [0.01, 0.1]], 'index_price': 70000, 'mark_price': 0.02, 'timestamp': 900}
         def fetch(method, params):
             return instrument if method == 'get_instrument' else book
-        result = deribit.quote('BTC-P', '0.3', '60000', fetch)
+        result = deribit.quote('BTC-P', '0.3', '60000', fetch, now=lambda: 0.9)
         self.assertEqual(Decimal(result['gross_btc']), Decimal('0.003'))
         self.assertEqual(Decimal(result['filled']), Decimal('0.2'))
         self.assertEqual(Decimal(result['unfilled']), Decimal('0.1'))
