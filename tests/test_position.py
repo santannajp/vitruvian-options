@@ -77,3 +77,26 @@ class ScenarioTest(unittest.TestCase):
             app.scenario(data)
             self.assertEqual(app.scenario(identity=('carteira', 'ethereum', 'aave'))['current']['input']['account'], 'carteira')
             self.assertEqual(app.scenario(identity=('outra', 'ethereum', 'aave'))['current']['input']['account'], 'outra')
+
+class FundsTest(unittest.TestCase):
+    def test_allocations_and_atomic_repayment(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(app, 'DB', Path(directory) / 'test.db'):
+            data = {'account': 'a', 'network': 'ethereum', 'market': 'aave', 'btc_price': '100', 'observed_at': '2026-01-01T00:00Z', 'collateral': [{'token': 'WBTC', 'contract': '0x1', 'quantity': '1', 'btc_ratio': '1', 'threshold': '80'}], 'debts': [{'token': 'USDC', 'contract': '0x2', 'quantity': '40', 'price': '1'}]}
+            app.scenario(data, True)
+            wallet = {'grid_btc': '0.1', 'balances': [{'token': 'USDC', 'location': 'rede', 'total': '25', 'reserva': '10', 'grid': '5', 'premios': '2', 'margem': '3', 'apostas': '1'}, {'token': 'USDC', 'location': 'Deribit', 'total': '10'}]}
+            saved = app.funds(wallet)
+            self.assertEqual(saved['balances'][0]['available'], '4')
+            result = app.repay({'account': 'a', 'network': 'ethereum', 'market': 'aave', 'token': 'USDC', 'amount': '12', 'request_id': 'one'})
+            self.assertEqual(result['funds']['balances'][0]['total'], '13')
+            self.assertEqual(result['funds']['balances'][0]['available'], '2')
+            self.assertEqual(result['scenario']['input']['debts'][0]['quantity'], '28')
+            self.assertEqual(result['scenario']['result']['health_factor'], str(app.Decimal(80) / app.Decimal(28)))
+            app.repay({'account': 'a', 'network': 'ethereum', 'market': 'aave', 'token': 'USDC', 'amount': '12', 'request_id': 'one'})
+            self.assertEqual(app.funds()['balances'][0]['total'], '13')
+            with self.assertRaises(ValueError):
+                app.repay({'account': 'a', 'network': 'ethereum', 'market': 'aave', 'token': 'USDC', 'amount': '9', 'request_id': 'two'})
+            self.assertEqual(app.funds()['balances'][0]['total'], '13')
+            wallet['balances'][0]['apostas'] = '40'
+            with self.assertRaises(ValueError):
+                app.funds(wallet)
+            self.assertEqual(app.funds()['balances'][0]['total'], '13')
