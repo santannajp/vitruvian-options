@@ -68,6 +68,7 @@ def history(db_path,now_ms=None):
         cashflows=[json.loads(x[0]) for x in rows('SELECT payload FROM audit_cashflows ORDER BY rowid DESC')]
         positions=[json.loads(x[0]) for x in rows('SELECT payload FROM paper_spreads ORDER BY id DESC')]
         closures=[json.loads(x[0]) for x in rows('SELECT payload FROM paper_closures ORDER BY rowid DESC')]
+        structure_closures=[json.loads(x[0]) for x in rows('SELECT payload FROM option_structure_closures ORDER BY rowid DESC')]
         rolls=[json.loads(x[0]) for x in rows('SELECT payload FROM paper_roll_events ORDER BY rowid DESC')]
         recoveries=[json.loads(x[0]) for x in rows('SELECT payload FROM recovery_events ORDER BY id DESC')]
     execution_keys={(x.get('evaluation_id'),x.get('quote',{}).get('buy'),x.get('quote',{}).get('sell'))
@@ -105,6 +106,15 @@ def history(db_path,now_ms=None):
                        'roll_count':item.get('roll_count',0),'net_roll_credits':item.get('net_roll_credits','0'),
                        'last_roll':item.get('last_roll'),
                        'pnl_adjustment_note':'PnL da opção já inclui prêmio e taxas de entrada/saída; juros de dívida, grid e funding ficam nos fluxos separados.'})
+    for item in structure_closures:
+        quote=item.get('quote',{})
+        closed.append({'request_id':item.get('request_id'),'venue':quote.get('venue'),'family':quote.get('family'),
+                       'score':None,'native_pnl':item.get('realized_pnl'),'currency':quote.get('entry_currency'),
+                       'pnl_usd':item.get('realized_pnl_usd'),'suggested':item.get('proposed_debit'),
+                       'executed':item.get('recotado'),'slippage_percent':item.get('slippage_percent'),
+                       'fees_open':quote.get('fees'),'fees_close':item.get('exit_fees'),
+                       'closed_at':item.get('closed_at'),'roll_count':0,'net_roll_credits':'0','last_roll':None,
+                       'pnl_adjustment_note':'PnL da estrutura inclui taxas de opção; juros e funding ficam nos fluxos externos.'})
     performance={}
     for item in closed:
         score=Decimal(str(item['score'])) if item['score'] is not None else None
