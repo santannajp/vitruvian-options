@@ -9,6 +9,9 @@ from decimal import ROUND_DOWN
 
 import spreads
 import derive
+import math
+
+DAY_MS=86400000
 
 
 def d(value):
@@ -52,11 +55,25 @@ def _fee(venue,item,amount,price,index):
     return d(item['base_fee'])+min(d(item['rate'])*amount*index,price*amount*d(item['fee_cap']))
 
 
+def _normal_cdf(x):
+    return (1+math.erf(x/math.sqrt(2)))/2
+
+
+def _bs_price(kind,spot,strike,days,volatility_percent):
+    spot,strike,days,vol=map(float,(spot,strike,days,volatility_percent))
+    if spot<0 or strike<=0 or vol<=0:raise ValueError('Spot não negativo, strike e volatilidade positivos são necessários.')
+    if spot==0:return 0.0 if kind=='call' else strike
+    t=max(0,days)/365
+    if t==0:return max(0,spot-strike) if kind=='call' else max(0,strike-spot)
+    sigma=vol/100;sigma_t=sigma*math.sqrt(t)
+    d1=(math.log(spot/strike)+.5*sigma*sigma*t)/sigma_t;d2=d1-sigma_t
+    if kind=='call':return spot*_normal_cdf(d1)-strike*_normal_cdf(d2)
+    return strike*_normal_cdf(-d2)-spot*_normal_cdf(-d1)
+
+
 def preview(data,fetch_snapshot=spreads.snapshot,now_ms=None):
     try:
         venue=str(data['venue']).lower();family=str(data['family']);size=d(data['size'])
-        if family in ('calendar','diagonal'):
-            raise ValueError('Calendários e diagonais exigem marcação própria da perna remanescente e serão habilitados na etapa 21.')
         if venue not in ('derive','deribit') or size<=0:raise ValueError('Exchange e tamanho válidos são necessários.')
         now=d(now_ms if now_ms is not None else time.time()*1000)
         raw=data['legs'];items=[fetch_snapshot(venue,item['instrument']) for item in raw]
@@ -96,26 +113,53 @@ def preview(data,fetch_snapshot=spreads.snapshot,now_ms=None):
         mark_usd=mark_pnl*index if currency=='BTC' and mark_pnl is not None else mark_pnl
         strikes=sorted({d(x['strike']) for x in legs});prices=sorted({Decimal(0),max(Decimal(1),strikes[0]*Decimal('.8')),index,*strikes,(strikes[0]+strikes[-1])/2,strikes[-1]*Decimal('1.2'),strikes[-1]+(strikes[-1]-strikes[0])})
         scenarios=[]
-        for price in prices:
-            payout=Decimal(0)
-            for leg in legs:
-                intrinsic=max(Decimal(0),price-d(leg['strike'])) if leg['type']=='call' else max(Decimal(0),d(leg['strike'])-price)
-                payout+=(intrinsic*size)*(1 if leg['side']=='buy' else -1)
-            scenarios.append({'btc_price_usd':str(price),'option_intrinsic_net_usd':str(payout),
-                              'pnl_at_expiry_usd':str(payout-entry_usd),
-                              'market_state':'baixa' if price<index else 'estabilidade' if price==index else 'alta'})
+        if family in ('calendar','diagonal'):
+            volatility=d(data.get('volatility_percent','60'))
+            vols=[d(x) for x in data.get('volatility_scenarios',[volatility*Decimal('.75'),volatility,volatility*Decimal('1.25')])]
+            if volatility<=0 or any(v<=0 or v>500 for v in vols):raise ValueError('IV e cenários de volatilidade devem estar entre 0 e 500%.')
+            near=next(x for x in legs if x['side']=='sell');far=next(x for x in legs if x['side']=='buy')
+            executable_exit=(d(far['exit_price'])*size*(index if currency=='BTC' else Decimal(1))
+                             if far['exit_price'] is not None and d(far['exit_depth'])>=size else None)
+            days_remaining=(d(far['expiry'])-d(near['expiry']))/DAY_MS
+            for price in prices:
+                near_intrinsic=max(Decimal(0),price-d(near['strike'])) if near['type']=='call' else max(Decimal(0),d(near['strike'])-price)
+                for vol in vols:
+                    long_value=d(str(_bs_price(far['type'],price,d(far['strike']),days_remaining,vol)))*size
+                    payout=long_value-near_intrinsic*size
+                    scenarios.append({'btc_price_usd':str(price),'volatility_percent':str(vol),
+                                      'remaining_leg_value_usd':str(long_value),
+                                      'remaining_leg_exit_available':executable_exit is not None,
+                                      'remaining_leg_executable_exit_usd':str(executable_exit) if executable_exit is not None else None,
+                                      'remaining_leg_exit_depth':far['exit_depth'],
+                                      'remaining_instrument':far['instrument'],'remaining_expiry':far['expiry'],
+                                      'expired_short_intrinsic_usd':str(near_intrinsic*size),
+                                      'pnl_at_expiry_usd':str(payout-entry_usd),
+                                      'market_state':'baixa' if price<index else 'estabilidade' if price==index else 'alta'})
+        else:
+            for price in prices:
+                payout=Decimal(0)
+                for leg in legs:
+                    intrinsic=max(Decimal(0),price-d(leg['strike'])) if leg['type']=='call' else max(Decimal(0),d(leg['strike'])-price)
+                    payout+=(intrinsic*size)*(1 if leg['side']=='buy' else -1)
+                scenarios.append({'btc_price_usd':str(price),'option_intrinsic_net_usd':str(payout),
+                                  'pnl_at_expiry_usd':str(payout-entry_usd),
+                                  'market_state':'baixa' if price<index else 'estabilidade' if price==index else 'alta'})
         values=[d(x['pnl_at_expiry_usd']) for x in scenarios]
         timestamps=[d(x['timestamp']) for x in legs]
         return {'venue':venue,'family':family,'size':str(size),'entry_currency':currency,'debit':str(entry_debit),
                 'fees':str(sum((d(x['fee']) for x in legs),Decimal(0))),'reference_btc_usd':str(index),
-                'expiry':max(x['expiry'] for x in legs),'legs':legs,'exit_available':exit_available,
+                'expiry':min(x['expiry'] for x in legs),'remaining_expiry':max(x['expiry'] for x in legs),'legs':legs,'exit_available':exit_available,
                 'close_debit':str(close_debit) if exit_available else None,'unrealized_pnl':str(mark_pnl) if mark_pnl is not None else None,'unrealized_currency':currency,
                 'unrealized_pnl_usd':str(mark_usd) if mark_usd is not None else None,
-                'maximum_loss_usd':str(min(Decimal(0),*values)),'risk_estimate_usd':str(max(Decimal(0),-min(Decimal(0),*values))),
-                'maximum_gain_usd':None if family in ('long_call','straddle','strangle') else str(max(Decimal(0),*values)),
-                'maximum_gain_note':'Ilimitado por exposição a call comprada.' if family in ('long_call','straddle','strangle') else 'Limitado pela estrutura.',
+                'maximum_loss_usd':None if family in ('calendar','diagonal') else str(min(Decimal(0),*values)),
+                'maximum_loss_note':'Cenários amostrados não estabelecem perda máxima global da exposição entre vencimentos.' if family in ('calendar','diagonal') else 'Perda máxima estimada nos pontos de quebra do payoff.',
+                'risk_estimate_usd':str(max(d(quote) for quote in [Decimal(0),-min(Decimal(0),*values),max(Decimal(0),entry_usd)])),
+                'maximum_gain_usd':None if family in ('long_call','straddle','strangle','calendar','diagonal') else str(max(Decimal(0),*values)),
+                'maximum_gain_note':'Ilimitado/modelo-dependente; veja cenários.' if family in ('long_call','straddle','strangle','calendar','diagonal') else 'Limitado pela estrutura.',
+                'remaining_days_after_first_expiry':str(days_remaining) if family in ('calendar','diagonal') else None,
+                'volatility_percent':str(volatility) if family in ('calendar','diagonal') else None,
                 'scenarios':scenarios,'timestamp':str(min(timestamps)),
-                'assumptions':'Payoffs de vencimento em USD; prêmio BTC da Deribit convertido pelo índice de entrada. Mark de saída usa melhor nível do livro; não é margem oficial.'}
+                'assumptions':'Calendário/diagonal: payoff intrínseco da perna curta no primeiro vencimento e Black-Scholes de taxa zero para a perna longa, com IV plana informada; demais famílias usam payoff no vencimento. Prêmio BTC convertido pelo índice de entrada; não replica margem ou settlement oficial.'}
     except (KeyError,TypeError,InvalidOperation) as exc:
         raise ValueError('Dados de estrutura de opções inválidos.') from exc
 
@@ -221,14 +265,15 @@ def _finalize(db_path,request_id,event_id,exit_debit,exit_fee,index,mode,settlem
         position=json.loads(row[0]);wallet=json.loads(wallet_row[0]);quote=position['quote']
         if entry_debit_actual is not None:position['entry_debit_actual']=str(entry_debit_actual)
         if position['status']!='aberta':raise ValueError('Estrutura já encerrada.')
-        pnl=-d(position.get('entry_debit_actual',quote['debit']))-d(exit_debit)
-        currency=quote['entry_currency'];pnl_usd=pnl*d(index) if currency=='BTC' else pnl
+        current_pnl=-d(position.get('entry_debit_actual',quote['debit']))-d(exit_debit)
+        currency=quote['entry_currency'];pnl=current_pnl+d(position.get('settled_pnl_native','0'))
+        pnl_usd=(current_pnl*d(index) if currency=='BTC' else current_pnl)+d(position.get('settled_pnl_usd','0'))
         balance=next((x for x in wallet['balances'] if x['token'].upper()==position['reserved_token'].upper() and x['location'].lower()==quote['venue']),None)
         if not balance:raise ValueError('Saldo reservado não encontrado.')
         reserve=d(position['reserved']);total=d(balance['total']);available=d(balance['available']);margin=d(balance.get('margem','0'))
-        if reserve>margin or total+pnl<0:raise ValueError('Saldo ou margem insuficiente para conciliar encerramento.')
-        balance['margem']=str(margin-reserve);balance['total']=str(total+pnl)
-        balance['available']=str(total+pnl-sum((d(balance.get(k,'0')) for k in ('reserva','grid','premios','margem','apostas')),Decimal(0)))
+        if reserve>margin or total+current_pnl<0:raise ValueError('Saldo ou margem insuficiente para conciliar encerramento.')
+        balance['margem']=str(margin-reserve);balance['total']=str(total+current_pnl)
+        balance['available']=str(total+current_pnl-sum((d(balance.get(k,'0')) for k in ('reserva','grid','premios','margem','apostas')),Decimal(0)))
         if d(balance['available'])<0:raise ValueError('Encerramento excederia o saldo livre após reservas.')
         payload={**position,'status':'encerrada','close_mode':mode,'closed_at':str(now_ms or time.time()*1000),
                  'event_id':event_id,'exit_debit':str(exit_debit),'exit_fees':str(exit_fee),'settlement':settlement,
@@ -244,6 +289,8 @@ def _position_flows(db_path,position,fetch_snapshot):
     if not any(d(x['quantity'])>0 for x in detail['opened_legs']):raise ValueError('Nenhuma perna preenchida para encerrar.')
     quote=position['quote'];index=d(quote['reference_btc_usd']);entry=exit_debit=exit_fee=Decimal(0);fills={x['instrument']:x for x in detail['opened_legs']};closed=[]
     for original in quote['legs']:
+        if any(x['instrument']==original['instrument'] for x in position.get('settled_legs',[])):
+            continue
         fill=fills[original['instrument']];amount=d(fill['quantity'])
         if not amount:continue
         snap=fetch_snapshot(quote['venue'],original['instrument'])
@@ -302,6 +349,61 @@ def settle_paper(db_path,request_id,event_id,btc_price,fee='0',now_ms=None):
         raise ValueError('Dados de settlement inválidos.') from exc
 
 
+def settle_leg(db_path,request_id,event_id,instrument,btc_price,fee='0',now_ms=None):
+    """Settle one expired leg of a calendar/diagonal and retain the later option."""
+    try:
+        request_id,event_id,instrument=map(str,(request_id,event_id,instrument));price=d(btc_price);fee=d(fee)
+        if price<=0 or fee<0:raise ValueError('Preço de BTC positivo e taxa não negativa são necessários.')
+        with closing(sqlite3.connect(db_path,timeout=10)) as con,con:
+            con.execute('BEGIN IMMEDIATE')
+            con.execute('CREATE TABLE IF NOT EXISTS option_structure_leg_settlements (event_id TEXT PRIMARY KEY,request_id TEXT NOT NULL,instrument TEXT NOT NULL,signature TEXT NOT NULL,payload TEXT NOT NULL,UNIQUE(request_id,instrument))')
+            old=con.execute('SELECT signature,payload FROM option_structure_leg_settlements WHERE event_id=?',(event_id,)).fetchone()
+            if old:
+                signature=json.dumps({'request_id':request_id,'instrument':instrument,'btc_price':str(price),'fee':str(fee)},sort_keys=True)
+                if old[0]!=signature:raise ValueError('ID de settlement reutilizado com outros dados.')
+                return json.loads(old[1])
+            row=con.execute('SELECT payload FROM option_structures WHERE request_id=?',(request_id,)).fetchone()
+            wallet_row=con.execute('SELECT payload FROM funds WHERE id=1').fetchone()
+            if not row or not wallet_row:raise ValueError('Estrutura ou carteira simulada não encontrada.')
+            position=json.loads(row[0]);quote=position['quote']
+            if quote['family'] not in ('calendar','diagonal'):raise ValueError('Settlement individual é reservado para calendários e diagonais.')
+            if position['status']!='aberta':raise ValueError('Estrutura já encerrada.')
+            leg=next((x for x in quote['legs'] if x['instrument']==instrument),None)
+            if not leg:raise ValueError('Instrumento não pertence à estrutura.')
+            if (time.time()*1000 if now_ms is None else now_ms)<int(leg['expiry']):raise ValueError('O vencimento desta perna ainda não ocorreu.')
+            detail=next(x for x in list_paper(db_path) if x['request_id']==request_id)
+            fill=next(x for x in detail['opened_legs'] if x['instrument']==instrument);quantity=d(fill['quantity'])
+            if quantity<=0:raise ValueError('Esta perna não teve preenchimento.')
+            if any(x['instrument']==instrument for x in position.get('settled_legs',[])):raise ValueError('Esta perna já foi liquidada.')
+            if con.execute('SELECT 1 FROM option_structure_leg_settlements WHERE request_id=? AND instrument=?',(request_id,instrument)).fetchone():
+                raise ValueError('Esta perna já foi liquidada.')
+            intrinsic=max(Decimal(0),price-d(leg['strike'])) if leg['type']=='call' else max(Decimal(0),d(leg['strike'])-price)
+            payout=intrinsic*quantity*(1 if leg['side']=='buy' else -1)
+            entry=d(fill['average_price'])*quantity*(1 if leg['side']=='buy' else -1)+d(fill['fee'])
+            currency=quote['entry_currency'];exit_debit=-payout/price+fee if currency=='BTC' else -payout+fee
+            realized=-entry-exit_debit;realized_usd=realized*price if currency=='BTC' else realized
+            wallet=json.loads(wallet_row[0]);balance=next((x for x in wallet['balances'] if x['token'].upper()==position['reserved_token'].upper() and x['location'].lower()==quote['venue']),None)
+            if not balance:raise ValueError('Saldo de settlement não encontrado.')
+            total=d(balance['total']);available=d(balance['available'])
+            if total+realized<0 or available+realized<0:raise ValueError('Saldo livre insuficiente para realizar esta perna.')
+            balance['total']=str(total+realized);balance['available']=str(available+realized)
+            result={'event_id':event_id,'request_id':request_id,'instrument':instrument,'btc_price_usd':str(price),
+                    'quantity':str(quantity),'intrinsic_usd':str(payout),'exit_fee':str(fee),
+                    'realized_pnl':str(realized),'realized_pnl_usd':str(realized_usd),'currency':currency,
+                    'remaining_instrument':next(x['instrument'] for x in quote['legs'] if x['instrument']!=instrument),
+                    'remaining_expiry':max(x['expiry'] for x in quote['legs']),'model':'intrínseco estimado; conciliar com settlement da exchange'}
+            position.setdefault('settled_legs',[]).append(result)
+            position['settled_pnl_native']=str(d(position.get('settled_pnl_native','0'))+realized)
+            position['settled_pnl_usd']=str(d(position.get('settled_pnl_usd','0'))+realized_usd)
+            con.execute('UPDATE funds SET payload=? WHERE id=1',(json.dumps(wallet),))
+            con.execute('UPDATE option_structures SET payload=? WHERE request_id=?',(json.dumps(position),request_id))
+            signature=json.dumps({'request_id':request_id,'instrument':instrument,'btc_price':str(price),'fee':str(fee)},sort_keys=True)
+            con.execute('INSERT INTO option_structure_leg_settlements VALUES(?,?,?,?,?)',(event_id,request_id,instrument,signature,json.dumps(result)))
+            return {**position,'last_settlement':result}
+    except (KeyError,TypeError,InvalidOperation,sqlite3.OperationalError) as exc:
+        raise ValueError('Dados de settlement por perna inválidos.') from exc
+
+
 def monitor(db_path,fetch_snapshot=spreads.snapshot):
     output=[]
     for position in list_paper(db_path):
@@ -310,9 +412,10 @@ def monitor(db_path,fetch_snapshot=spreads.snapshot):
         quote=position['quote']
         try:
             flows=_position_flows(db_path,position,fetch_snapshot)
-            pnl=-d(position.get('entry_debit_actual',quote['debit']))-flows['exit_debit']
+            current_pnl=-d(position.get('entry_debit_actual',quote['debit']))-flows['exit_debit']
+            pnl=current_pnl+d(position.get('settled_pnl_native','0'))
             output.append({**position,'market_status':'atualizado','live_quote':flows,
-                           'unrealized_pnl':str(pnl),'unrealized_pnl_usd':str(pnl*flows['index'] if quote['entry_currency']=='BTC' else pnl)})
+                           'unrealized_pnl':str(pnl),'unrealized_pnl_usd':str((current_pnl*flows['index'] if quote['entry_currency']=='BTC' else current_pnl)+d(position.get('settled_pnl_usd','0')))})
         except (ValueError,OSError,TimeoutError,derive.WebSocketException) as exc:
             output.append({**position,'market_status':'indisponivel','market_error':str(exc)})
     return output

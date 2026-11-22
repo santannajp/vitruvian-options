@@ -116,5 +116,47 @@ class StructureTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'ordenar asas'):
             self.quote('iron_condor',legs)
 
+    def calendar_snapshot(self,venue,name):
+        kind='call';strike=name.split('-')[1]
+        far=name.endswith('F')
+        return {'name':name,'type':kind,'strike':strike,'expiry':1810000000000 if far else 1800000000000,
+                'minimum':'0.1','step':'0.1','maximum':'100','asks':[['5','10']],
+                'bids':[['4','10']],'index':'100','timestamp':time.time()*1000,
+                'rate':'0','base_fee':'0','fee_cap':'0.125'}
+
+    def test_calendar_and_diagonal_scenarios_value_remaining_leg_across_volatility(self):
+        calendar=structures.preview({'venue':'derive','family':'calendar','size':'1',
+            'legs':[{'instrument':'CALL-100-F','side':'buy'},{'instrument':'CALL-100-N','side':'sell'}],
+            'volatility_percent':'60'},self.calendar_snapshot)
+        diagonal=structures.preview({'venue':'derive','family':'diagonal','size':'1',
+            'legs':[{'instrument':'CALL-110-F','side':'buy'},{'instrument':'CALL-100-N','side':'sell'}],
+            'volatility_percent':'60'},self.calendar_snapshot)
+        self.assertEqual(calendar['debit'],'1')
+        self.assertEqual(calendar['expiry'],1800000000000)
+        self.assertEqual(calendar['remaining_expiry'],1810000000000)
+        self.assertEqual(len(calendar['scenarios']),len({x['btc_price_usd'] for x in calendar['scenarios']})*3)
+        self.assertIsNone(calendar['maximum_loss_usd'])
+        self.assertEqual(len({x['volatility_percent'] for x in calendar['scenarios']}),3)
+        self.assertGreater(float(calendar['scenarios'][4]['remaining_leg_value_usd']),0)
+        self.assertTrue(all(x['remaining_leg_exit_available'] for x in calendar['scenarios']))
+        self.assertEqual(calendar['scenarios'][0]['remaining_leg_executable_exit_usd'],'4')
+        self.assertEqual(diagonal['family'],'diagonal')
+
+    def test_first_calendar_expiry_settles_short_only_and_keeps_far_leg(self):
+        data={'request_id':'calendar-1','venue':'derive','family':'calendar','size':'1',
+              'legs':[{'instrument':'CALL-100-F','side':'buy'},{'instrument':'CALL-100-N','side':'sell'}],
+              'volatility_percent':'60','proposed_debit':'1','tolerance_percent':'2'}
+        opened=structures.open_paper(self.db,data,self.calendar_snapshot)
+        first=structures.settle_leg(self.db,'calendar-1','first-expiry','CALL-100-N','90',now_ms=1800000000001)
+        self.assertEqual(first['last_settlement']['realized_pnl'],'4')
+        self.assertEqual(len(first['settled_legs']),1)
+        self.assertEqual(first['settled_legs'][0]['remaining_instrument'],'CALL-100-F')
+        replay=structures.settle_leg(self.db,'calendar-1','first-expiry','CALL-100-N','90',now_ms=1800000000001)
+        self.assertEqual(replay,first['last_settlement'])
+        closed=structures.close_paper(self.db,'calendar-1','close-long-only',self.calendar_snapshot)
+        from decimal import Decimal
+        self.assertEqual(Decimal(closed['realized_pnl']),Decimal('3'))
+        self.assertEqual(closed['status'],'encerrada')
+
 
 if __name__=='__main__':unittest.main()
