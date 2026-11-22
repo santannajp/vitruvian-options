@@ -399,7 +399,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
-        if self.path not in ('/api/position', '/api/scenario', '/api/funds', '/api/repay', '/api/liquidation', '/api/recovery', '/api/deribit/quote', '/api/derive/quote', '/api/protection', '/api/spreads/scan', '/api/spreads/preview', '/api/paper/open'):
+        if self.path not in ('/api/position', '/api/scenario', '/api/funds', '/api/repay', '/api/liquidation', '/api/recovery', '/api/deribit/quote', '/api/derive/quote', '/api/protection', '/api/spreads/scan', '/api/spreads/preview', '/api/paper/open', '/api/paper/fill'):
             self.send_error(404)
             return
         try:
@@ -423,6 +423,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = spreads.preview(data['venue'], data['direction'], data['entry'], data['buy'], data['sell'], data['size'])
             elif self.path == '/api/paper/open':
                 result = paper.open_spread(DB, data)
+            elif self.path == '/api/paper/fill':
+                result = paper.record_fill(DB, data)
             elif self.path == '/api/protection':
                 result = compare_protection(data)
             elif self.path == '/api/derive/quote':
