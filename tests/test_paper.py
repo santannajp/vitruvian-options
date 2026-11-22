@@ -11,7 +11,8 @@ def preview(venue, direction, entry, buy, sell, size):
     return {'venue':venue,'direction':direction,'entry':entry,'buy':buy,'sell':sell,
             'size':size,'entry_currency':'USDC','debit':'1.05','fees':'0.05',
             'risk_estimate_usd':'10','reference_btc_usd':'100000',
-            'buy_price':'2','sell_price':'1','expiry':1800000000000}
+            'buy_price':'2','sell_price':'1','expiry':1800000000000,'type':'call',
+            'buy_strike':'100','sell_strike':'110'}
 
 
 class PaperTest(unittest.TestCase):
@@ -58,6 +59,39 @@ class PaperTest(unittest.TestCase):
         paper.open_spread(self.db, self.request, preview)
         with self.assertRaisesRegex(ValueError, 'Identificador já usado'):
             paper.open_spread(self.db, {**self.request, 'size':'2'}, preview)
+
+    def test_close_releases_reserve_and_records_realized_pnl_once(self):
+        paper.open_spread(self.db, self.request, preview)
+        calls=[]
+        def close(venue, buy, sell, size):
+            calls.append((venue,buy,sell,size))
+            return {'close_debit':'-0.5','reference_btc_usd':'100000','currency':'USDC','fees':'0.1','timestamp':1800000000000}
+        first=paper.close_spread(self.db,'one','close-1',close)
+        second=paper.close_spread(self.db,'one','close-2',lambda *args: self.fail('must not close twice'))
+        self.assertEqual(first,second)
+        self.assertEqual(first['realized_pnl'],'-0.55')
+        self.assertEqual(first['status'],'encerrada')
+        self.assertEqual(len(calls),1)
+        with patch.object(app, 'DB', self.db):
+            balance=app.funds()['balances'][0]
+        self.assertEqual(balance['margem'],'0.00')
+        self.assertEqual(balance['total'],'99.45')
+        self.assertEqual(balance['available'],'99.45')
+
+    def test_monitor_suspends_only_position_with_stale_market(self):
+        paper.open_spread(self.db, self.request, preview)
+        positions=paper.monitor(self.db, lambda *args: (_ for _ in ()).throw(TimeoutError('feed antigo')))
+        self.assertEqual(positions[0]['market_status'],'indisponivel')
+        self.assertIn('feed antigo',positions[0]['market_error'])
+
+    def test_settlement_after_expiry_uses_intrinsic_model_and_releases_reserve(self):
+        paper.open_spread(self.db, self.request, preview)
+        with self.assertRaisesRegex(ValueError, 'ainda não ocorreu'):
+            paper.close_spread(self.db,'one','expiry-early',settlement={'btc_price':'105'},now_ms=1700000000000)
+        settled=paper.close_spread(self.db,'one','expiry-1',settlement={'btc_price':'105','fee':'0.1'},now_ms=1900000000000)
+        self.assertEqual(settled['close_mode'],'vencimento')
+        self.assertEqual(settled['exit_quote']['intrinsic_usd'],'5')
+        self.assertEqual(settled['realized_pnl'],'3.85')
 
 
 if __name__ == '__main__':

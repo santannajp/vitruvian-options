@@ -161,3 +161,31 @@ def scan(venue, expiry, direction, entry, size):
         except (ValueError, OSError, TimeoutError, derive.WebSocketException) as exc:
             excluded.append({'buy': candidate['buy'], 'sell': candidate['sell'], 'reason': str(exc)})
     return {'candidates': results, 'excluded': excluded, 'index': str(index)}
+
+
+def close_quote(venue, buy_name, sell_name, size, fetch_snapshot=snapshot):
+    """Quote an exit: sell the original long at bid and cover the short at ask."""
+    amount = decimal(size)
+    buy, sell = fetch_snapshot(venue, buy_name), fetch_snapshot(venue, sell_name)
+    if time.time()*1000-min(buy['timestamp'],sell['timestamp']) > 30000:
+        raise ValueError('Um dos livros ficou desatualizado durante a saída.')
+    if buy['type'] != sell['type'] or buy['expiry'] != sell['expiry'] or not buy['bids'] or not sell['asks']:
+        raise ValueError('Livros incompatíveis ou sem liquidez para encerrar.')
+    if any(amount < decimal(x['minimum']) or amount % decimal(x['step']) or (x['maximum'] and amount > decimal(x['maximum'])) for x in (buy,sell)):
+        raise ValueError('Quantidade fora dos limites de lote para encerrar.')
+    bid,bid_qty=map(decimal,buy['bids'][0]); ask,ask_qty=map(decimal,sell['asks'][0])
+    if min(bid_qty,ask_qty)<amount:
+        raise ValueError('Profundidade insuficiente para encerrar as duas pernas.')
+    index=decimal(buy['index'])
+    if venue=='deribit':
+        fee=amount*(min(decimal(buy['rate']),bid*decimal(buy['fee_cap']))+min(decimal(sell['rate']),ask*decimal(sell['fee_cap'])))
+    elif venue=='derive':
+        fee=decimal(buy['base_fee'])+min(decimal(buy['rate'])*amount*index,bid*amount*decimal(buy['fee_cap']))
+        fee+=decimal(sell['base_fee'])+min(decimal(sell['rate'])*amount*index,ask*amount*decimal(sell['fee_cap']))
+    else:
+        raise ValueError('Exchange inválida.')
+    cashflow=(ask-bid)*amount+fee
+    return {'buy_to_close':sell_name,'sell_to_close':buy_name,'size':str(amount),'close_debit':str(cashflow),
+            'sell_long_bid':str(bid),'buy_short_ask':str(ask),'fees':str(fee),'currency':'BTC' if venue=='deribit' else 'USDC',
+            'reference_btc_usd':str(index),'timestamp':min(buy['timestamp'],sell['timestamp']),
+            'timestamp_buy':sell['timestamp'],'timestamp_sell':buy['timestamp']}

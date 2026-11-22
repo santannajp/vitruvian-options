@@ -393,13 +393,15 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(200, json.dumps(funds()).encode(), 'application/json')
         elif self.path == '/api/paper':
             self.respond(200, json.dumps(paper.list_spreads(DB)).encode(), 'application/json')
+        elif self.path == '/api/paper/monitor':
+            self.respond(200, json.dumps(paper.monitor(DB)).encode(), 'application/json')
         elif self.path == '/':
             self.respond(200, Path(__file__).with_name('index.html').read_bytes(), 'text/html; charset=utf-8')
         else:
             self.send_error(404)
 
     def do_POST(self):
-        if self.path not in ('/api/position', '/api/scenario', '/api/funds', '/api/repay', '/api/liquidation', '/api/recovery', '/api/deribit/quote', '/api/derive/quote', '/api/protection', '/api/spreads/scan', '/api/spreads/preview', '/api/paper/open', '/api/paper/fill'):
+        if self.path not in ('/api/position', '/api/scenario', '/api/funds', '/api/repay', '/api/liquidation', '/api/recovery', '/api/deribit/quote', '/api/derive/quote', '/api/protection', '/api/spreads/scan', '/api/spreads/preview', '/api/paper/open', '/api/paper/fill', '/api/paper/close'):
             self.send_error(404)
             return
         try:
@@ -425,6 +427,9 @@ class Handler(BaseHTTPRequestHandler):
                 result = paper.open_spread(DB, data)
             elif self.path == '/api/paper/fill':
                 result = paper.record_fill(DB, data)
+            elif self.path == '/api/paper/close':
+                result = paper.close_spread(DB, data['request_id'], data['event_id'],
+                                            settlement=data.get('settlement'))
             elif self.path == '/api/protection':
                 result = compare_protection(data)
             elif self.path == '/api/derive/quote':
