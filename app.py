@@ -2,6 +2,7 @@
 import json
 import os
 import sqlite3
+import deribit
 from contextlib import closing
 from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -338,6 +339,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(200, json.dumps(recovery(identity=identity)).encode(), 'application/json')
             except (KeyError, ValueError) as exc:
                 self.respond(400, json.dumps({'error': str(exc)}).encode(), 'application/json')
+        elif self.path == '/api/deribit/instruments':
+            try:
+                self.respond(200, json.dumps(deribit.instruments()).encode(), 'application/json')
+            except (OSError, ValueError, KeyError) as exc:
+                self.respond(503, json.dumps({'error': str(exc)}).encode(), 'application/json')
         elif self.path == '/api/funds':
             self.respond(200, json.dumps(funds()).encode(), 'application/json')
         elif self.path == '/':
@@ -346,7 +352,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
-        if self.path not in ('/api/position', '/api/scenario', '/api/funds', '/api/repay', '/api/liquidation', '/api/recovery'):
+        if self.path not in ('/api/position', '/api/scenario', '/api/funds', '/api/repay', '/api/liquidation', '/api/recovery', '/api/deribit/quote'):
             self.send_error(404)
             return
         try:
@@ -364,11 +370,13 @@ class Handler(BaseHTTPRequestHandler):
                 result = simulate_liquidation(data)
             elif self.path == '/api/recovery':
                 result = recovery(data)
+            elif self.path == '/api/deribit/quote':
+                result = deribit.quote(data['instrument'], data['size'], data['expiry_price'])
             else:
                 save(data)
                 result = load()
             self.respond(200, json.dumps(result).encode(), 'application/json')
-        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        except (ValueError, TypeError, KeyError, OSError, json.JSONDecodeError) as exc:
             self.respond(400, json.dumps({'error': str(exc)}).encode(), 'application/json')
 
     def respond(self, status, body, content_type):
