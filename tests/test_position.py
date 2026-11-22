@@ -125,3 +125,23 @@ class LiquidationTest(unittest.TestCase):
             position['debts'][0]['quantity'] = '4000'
             app.scenario(position)
             self.assertEqual(app.simulate_liquidation(data)['event'], 'sem_liquidacao')
+
+class RecoveryTest(unittest.TestCase):
+    def test_two_liquidations_repurchase_adjustment_and_replay(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(app, 'DB', Path(directory) / 'test.db'):
+            position = {'account': 'a', 'network': 'ethereum', 'market': 'aave', 'btc_price': '10000', 'observed_at': '2026-01-01T00:00Z', 'collateral': [{'token': 'WBTC', 'contract': '0x1', 'quantity': '1', 'btc_ratio': '1', 'threshold': '80'}], 'debts': [{'token': 'USDC', 'contract': '0x2', 'quantity': '9000', 'price': '1'}]}
+            app.scenario(position, True)
+            identity = {'account': 'a', 'network': 'ethereum', 'market': 'aave'}
+            event = {**identity, 'event_id': '1', 'kind': 'liquidacao', 'observed_at': '2026-01-02', 'value_btc': '0.6', 'projected_btc': '0.55', 'debt_usd': '4000'}
+            app.recovery(event)
+            app.recovery(event)
+            app.recovery({**identity, 'event_id': '2', 'kind': 'recompra', 'observed_at': '2026-01-03', 'value_btc': '0.1'})
+            app.recovery({**identity, 'event_id': '3', 'kind': 'ajuste', 'observed_at': '2026-01-04', 'value_btc': '0.2'})
+            final = app.recovery({**identity, 'event_id': '4', 'kind': 'liquidacao', 'observed_at': '2026-01-05', 'value_btc': '0.5', 'projected_btc': '0.45', 'debt_usd': '1000'})
+            self.assertEqual(len(final['events']), 4)
+            self.assertEqual(app.Decimal(final['target_btc']), app.Decimal('1.2'))
+            self.assertEqual(app.Decimal(final['deficit_btc']), app.Decimal('0.6'))
+            self.assertEqual(final['remaining_debt_usd'], '1000')
+            position['collateral'][0]['quantity'] = '2'
+            app.scenario(position, True)
+            self.assertEqual(app.recovery(identity=('a', 'ethereum', 'aave'))['target_btc'], '1.2')

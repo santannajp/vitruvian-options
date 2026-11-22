@@ -255,6 +255,74 @@ def simulate_liquidation(data):
         raise ValueError('Dados de liquidação inválidos.') from exc
 
 
+def recovery_events(identity, original, event=None):
+    """Maintain an auditable sequence of observed balances and recovery actions."""
+    with closing(sqlite3.connect(DB)) as con, con:
+        con.execute('CREATE TABLE IF NOT EXISTS recovery_baselines (account TEXT, network TEXT, market TEXT, original TEXT NOT NULL, PRIMARY KEY(account,network,market))')
+        con.execute('CREATE TABLE IF NOT EXISTS recovery_events (id INTEGER PRIMARY KEY AUTOINCREMENT, account TEXT NOT NULL, network TEXT NOT NULL, market TEXT NOT NULL, event_id TEXT NOT NULL, payload TEXT NOT NULL, UNIQUE(account, network, market, event_id))')
+        if event is not None:
+            try:
+                event_id = str(event['event_id']).strip()
+                kind = str(event['kind'])
+                observed_at = str(event['observed_at']).strip()
+                if not event_id or not observed_at or kind not in ('liquidacao', 'recompra', 'ajuste'):
+                    raise ValueError('Informe identificador, data e tipo válido.')
+                value = Decimal(str(event['value_btc']))
+                debt = Decimal(str(event.get('debt_usd', '0')))
+                if not value.is_finite() or not debt.is_finite() or debt < 0 or (value < 0 and kind != 'ajuste'):
+                    raise ValueError('Valores do evento inválidos.')
+                if kind == 'liquidacao':
+                    if 'debt_usd' not in event:
+                        raise ValueError('Informe a dívida remanescente.')
+                    projected = Decimal(str(event['projected_btc']))
+                    if not projected.is_finite() or projected < 0:
+                        raise ValueError('Informe a garantia projetada.')
+                payload = json.dumps(event, sort_keys=True)
+                previous = con.execute('SELECT payload FROM recovery_events WHERE account=? AND network=? AND market=? AND event_id=?', (*identity, event_id)).fetchone()
+                if previous and previous[0] != payload:
+                    raise ValueError('Identificador já registrado com outro conteúdo.')
+                if not previous:
+                    con.execute('INSERT OR IGNORE INTO recovery_baselines VALUES (?,?,?,?)', (*identity, json.dumps(original)))
+                    con.execute('INSERT INTO recovery_events (account,network,market,event_id,payload) VALUES (?,?,?,?,?)', (*identity, event_id, payload))
+            except (KeyError, TypeError, InvalidOperation) as exc:
+                raise ValueError('Dados de conciliação inválidos.') from exc
+        rows = con.execute('SELECT payload FROM recovery_events WHERE account=? AND network=? AND market=? ORDER BY id', identity).fetchall()
+        baseline = con.execute('SELECT original FROM recovery_baselines WHERE account=? AND network=? AND market=?', identity).fetchone()
+        return [json.loads(row[0]) for row in rows], json.loads(baseline[0]) if baseline else original
+
+
+def recovery(data=None, identity=None):
+    if data is not None:
+        identity = tuple(str(data[key]).strip() for key in ('account', 'network', 'market'))
+    position = scenario(identity=identity)
+    if not position or not position['original']:
+        raise ValueError('Salve primeiro um cenário original para esta conta.')
+    events, baseline = recovery_events(identity, position['original'], data)
+    original = baseline['input']
+    initial = sum(Decimal(str(item['quantity'])) * Decimal(str(item['btc_ratio'])) for item in original['collateral'])
+    target = initial
+    purchased = Decimal(0)
+    observed = initial
+    debt = None
+    history = []
+    for event in events:
+        value = Decimal(str(event['value_btc']))
+        if event['kind'] == 'ajuste':
+            target += value
+            observed += value
+        elif event['kind'] == 'recompra':
+            purchased += value
+        else:
+            observed = value
+            debt = event['debt_usd']
+        history.append({**event, 'target_btc': str(target), 'observed_btc': str(observed),
+                        'purchased_btc': str(purchased), 'deficit_btc': str(max(Decimal(0), target - observed - purchased)),
+                        'remaining_debt_usd': debt})
+    return {'original': baseline, 'events': history, 'target_btc': str(target),
+            'observed_btc': str(observed), 'purchased_btc': str(purchased),
+            'deficit_btc': str(max(Decimal(0), target - observed - purchased)), 'remaining_debt_usd': debt}
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/api/position':
@@ -263,6 +331,13 @@ class Handler(BaseHTTPRequestHandler):
             params = parse_qs(urlsplit(self.path).query)
             identity = tuple(params.get(key, [''])[0] for key in ('account', 'network', 'market')) if params else None
             self.respond(200, json.dumps(scenario(identity=identity)).encode(), 'application/json')
+        elif urlsplit(self.path).path == '/api/recovery':
+            params = parse_qs(urlsplit(self.path).query)
+            try:
+                identity = tuple(params[key][0] for key in ('account', 'network', 'market'))
+                self.respond(200, json.dumps(recovery(identity=identity)).encode(), 'application/json')
+            except (KeyError, ValueError) as exc:
+                self.respond(400, json.dumps({'error': str(exc)}).encode(), 'application/json')
         elif self.path == '/api/funds':
             self.respond(200, json.dumps(funds()).encode(), 'application/json')
         elif self.path == '/':
@@ -271,7 +346,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
-        if self.path not in ('/api/position', '/api/scenario', '/api/funds', '/api/repay', '/api/liquidation'):
+        if self.path not in ('/api/position', '/api/scenario', '/api/funds', '/api/repay', '/api/liquidation', '/api/recovery'):
             self.send_error(404)
             return
         try:
@@ -287,6 +362,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = repay(data)
             elif self.path == '/api/liquidation':
                 result = simulate_liquidation(data)
+            elif self.path == '/api/recovery':
+                result = recovery(data)
             else:
                 save(data)
                 result = load()
