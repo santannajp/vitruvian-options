@@ -50,3 +50,14 @@ class SpreadTest(unittest.TestCase):
         self.assertEqual(suggested, manual)
         self.assertEqual(suggested['maximum_gain_usd'], '9')
         self.assertEqual(suggested['maximum_loss_usd'], '-1')
+
+    def test_close_quote_sells_long_and_covers_short_on_both_venues(self):
+        def snapshot(venue,name):
+            return {'name':name,'type':'call','strike':'100' if name=='LONG' else '110','expiry':1000,
+                    'minimum':'1','step':'1','maximum':'10','bids':[['4','5']], 'asks':[['5','5']],
+                    'index':'100','timestamp':1800000000000,'rate':'0','base_fee':'0','fee_cap':'0.125'}
+        for venue in ('deribit','derive'):
+            result=spreads.close_quote(venue,'LONG','SHORT','1',snapshot)
+            self.assertEqual(result['sell_long_bid'],'4')
+            self.assertEqual(result['buy_short_ask'],'5')
+            self.assertEqual(result['close_debit'],'1')

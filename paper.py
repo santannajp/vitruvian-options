@@ -1,11 +1,13 @@
 """Persistent paper trading for option spreads; this module never sends orders."""
 import json
 import sqlite3
+import time
 import uuid
 from contextlib import closing
 from decimal import Decimal, InvalidOperation
 
 import spreads
+import derive
 
 
 def _d(value):
@@ -179,3 +181,83 @@ def reconciled(db_path, spread):
     spread['unhedged_quantity'] = str(abs(_d(legs[0]['quantity'])-_d(legs[1]['quantity'])))
     spread['effective_fees'] = str(sum((_d(leg['fee']) for leg in legs), Decimal(0)))
     return spread
+
+
+def close_spread(db_path, request_id, event_id, close=spreads.close_quote, settlement=None, now_ms=None):
+    """Close a reconciled paper vertical, release its reserve and realize native-currency PnL."""
+    try:
+        request_id,event_id=str(request_id).strip(),str(event_id).strip()
+        if not request_id or not event_id:
+            raise ValueError('Identificadores de posição e encerramento obrigatórios.')
+        with closing(sqlite3.connect(db_path)) as con:
+            con.execute('CREATE TABLE IF NOT EXISTS paper_closures (event_id TEXT PRIMARY KEY, request_id TEXT UNIQUE NOT NULL, payload TEXT NOT NULL)')
+            old=con.execute('SELECT payload FROM paper_closures WHERE request_id=?',(request_id,)).fetchone()
+            if old:return json.loads(old[0])
+            row=con.execute('SELECT payload FROM paper_spreads WHERE request_id=?',(request_id,)).fetchone()
+        if not row:raise ValueError('Posição simulada não encontrada.')
+        opened=reconciled(db_path,json.loads(row[0]))
+        if opened['status']!='aberta':raise ValueError('Posição já encerrada ou expirada.')
+        if opened.get('roll_blocked'):raise ValueError('Reconcilie as duas pernas antes de encerrar.')
+        quote=opened['quote']
+        if settlement is None:
+            exit_quote=close(quote['venue'],quote['buy'],quote['sell'],quote['size'])
+            close_mode='mercado'
+        else:
+            settlement_price=_d(settlement['btc_price']);settlement_fee=_d(settlement.get('fee','0'))
+            if settlement_price<=0 or settlement_fee<0:raise ValueError('Preço de liquidação positivo e taxa não negativa são necessários.')
+            if (time.time()*1000 if now_ms is None else now_ms)<int(quote['expiry']):raise ValueError('O vencimento da estrutura ainda não ocorreu.')
+            long_intrinsic=max(Decimal(0),settlement_price-_d(quote['buy_strike'])) if quote['type']=='call' else max(Decimal(0),_d(quote['buy_strike'])-settlement_price)
+            short_intrinsic=max(Decimal(0),settlement_price-_d(quote['sell_strike'])) if quote['type']=='call' else max(Decimal(0),_d(quote['sell_strike'])-settlement_price)
+            intrinsic_usd=(long_intrinsic-short_intrinsic)*_d(quote['size'])
+            currency=quote['entry_currency']
+            close_debit=-intrinsic_usd/settlement_price+settlement_fee if currency=='BTC' else -intrinsic_usd+settlement_fee
+            exit_quote={'close_debit':str(close_debit),'fees':str(settlement_fee),'currency':currency,
+                        'reference_btc_usd':str(settlement_price),'timestamp':now_ms or time.time()*1000,
+                        'settlement_price_btc_usd':str(settlement_price),'intrinsic_usd':str(intrinsic_usd),
+                        'model':'intrínseco estimado; não substitui conciliação oficial da exchange'}
+            close_mode='vencimento'
+        pnl=-_d(quote['debit'])-_d(exit_quote['close_debit'])
+        currency=quote['entry_currency']
+        usd_pnl=pnl*_d(exit_quote['reference_btc_usd']) if currency=='BTC' else pnl
+        with closing(sqlite3.connect(db_path,timeout=10)) as con,con:
+            con.execute('BEGIN IMMEDIATE')
+            old=con.execute('SELECT payload FROM paper_closures WHERE request_id=?',(request_id,)).fetchone()
+            if old:return json.loads(old[0])
+            wallet_row=con.execute('SELECT payload FROM funds WHERE id=1').fetchone()
+            if not wallet_row:raise ValueError('Carteira de papel não encontrada.')
+            wallet=json.loads(wallet_row[0]); token=opened['reserved_token'];venue=quote['venue']
+            balance=next((x for x in wallet['balances'] if x['token'].upper()==token.upper() and x['location'].lower()==venue.lower()),None)
+            if not balance:raise ValueError('Saldo reservado não encontrado.')
+            reserve=_d(opened['reserved']);total=_d(balance['total']);available=_d(balance['available']);margin=_d(balance.get('margem','0'))
+            if reserve>margin or total+pnl<0:raise ValueError('Reserva ou saldo insuficiente para conciliar encerramento.')
+            balance['margem']=str(margin-reserve);balance['total']=str(total+pnl);balance['available']=str(available+reserve+pnl)
+            balance['available']=str(total+pnl-sum((_d(balance.get(k,'0')) for k in ('reserva','grid','premios','margem','apostas')),Decimal(0)))
+            if _d(balance['available'])<0:raise ValueError('Encerramento excederia o saldo livre após reservas.')
+            closed={**opened,'status':'encerrada','closed_at':time.time()*1000,'close_mode':close_mode,'exit_quote':exit_quote,
+                    'realized_pnl':str(pnl),'realized_pnl_usd':str(usd_pnl),'realized_currency':currency,
+                    'wallet':wallet,'event_id':event_id}
+            con.execute('UPDATE funds SET payload=? WHERE id=1',(json.dumps(wallet),))
+            con.execute('UPDATE paper_spreads SET status=?,payload=? WHERE request_id=?',('encerrada',json.dumps(closed),request_id))
+            con.execute('INSERT INTO paper_closures VALUES(?,?,?)',(event_id,request_id,json.dumps(closed)))
+            return closed
+    except (KeyError,TypeError,InvalidOperation,sqlite3.OperationalError) as exc:
+        raise ValueError('Dados de encerramento inválidos.') from exc
+
+
+def monitor(db_path, close=spreads.close_quote):
+    results=[]
+    for position in list_spreads(db_path):
+        if position.get('status')!='aberta':
+            results.append(position);continue
+        if position.get('roll_blocked'):
+            results.append({**position,'market_status':'suspensa','market_error':'Reconcilie a exposição antes de marcar ou encerrar.'});continue
+        quote=position['quote']
+        try:
+            exit_quote=close(quote['venue'],quote['buy'],quote['sell'],quote['size'])
+            pnl=-_d(quote['debit'])-_d(exit_quote['close_debit'])
+            usd=pnl*_d(exit_quote['reference_btc_usd']) if quote['entry_currency']=='BTC' else pnl
+            results.append({**position,'market_status':'atualizada','exit_quote':exit_quote,'unrealized_pnl':str(pnl),
+                            'unrealized_currency':quote['entry_currency'],'unrealized_pnl_usd':str(usd)})
+        except (ValueError,OSError,TimeoutError,derive.WebSocketException) as exc:
+            results.append({**position,'market_status':'indisponivel','market_error':str(exc)})
+    return results
