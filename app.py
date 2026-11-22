@@ -2,6 +2,7 @@
 import json
 import os
 import sqlite3
+from contextlib import closing
 from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -21,14 +22,14 @@ def save(data):
             raise ValueError('Informe valores não negativos e limiar entre 0 e 100.')
     except InvalidOperation as exc:
         raise ValueError('Informe valores numéricos válidos.') from exc
-    with sqlite3.connect(DB) as con:
+    with closing(sqlite3.connect(DB)) as con, con:
         con.execute('CREATE TABLE IF NOT EXISTS position (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)')
         con.execute('INSERT OR REPLACE INTO position VALUES (1, ?)', (json.dumps(values),))
     return values
 
 
 def load():
-    with sqlite3.connect(DB) as con:
+    with closing(sqlite3.connect(DB)) as con, con:
         con.execute('CREATE TABLE IF NOT EXISTS position (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)')
         row = con.execute('SELECT payload FROM position WHERE id = 1').fetchone()
     if not row:
@@ -86,7 +87,7 @@ def calculate_scenario(data):
 
 
 def scenario(data=None, snapshot=False, identity=None):
-    with sqlite3.connect(DB) as con:
+    with closing(sqlite3.connect(DB)) as con, con:
         con.execute('CREATE TABLE IF NOT EXISTS scenario_positions (account TEXT, network TEXT, market TEXT, current TEXT, original TEXT, PRIMARY KEY (account, network, market))')
         if data is not None:
             result = calculate_scenario(data)
@@ -103,6 +104,95 @@ def scenario(data=None, snapshot=False, identity=None):
         return {'current': json.loads(row[0]), 'original': json.loads(row[1]) if row[1] else None} if row else None
 
 
+ALLOCATIONS = ('reserva', 'grid', 'premios', 'margem', 'apostas')
+
+
+def funds(data=None):
+    with closing(sqlite3.connect(DB)) as con, con:
+        con.execute('CREATE TABLE IF NOT EXISTS funds (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)')
+        row = con.execute('SELECT payload FROM funds WHERE id = 1').fetchone()
+        if data is None:
+            return json.loads(row[0]) if row else None
+        try:
+            balances = data['balances']
+            if not isinstance(balances, list) or not balances:
+                raise ValueError('Informe ao menos um saldo.')
+            seen = set()
+            cleaned = []
+            for balance in balances:
+                token = str(balance['token']).strip()
+                location = str(balance['location']).strip()
+                key = (token.lower(), location.lower())
+                if not token or not location or key in seen:
+                    raise ValueError('Informe saldos únicos por moeda e local.')
+                seen.add(key)
+                total = Decimal(str(balance['total']))
+                allocated = {key: Decimal(str(balance.get(key, '0'))) for key in ALLOCATIONS}
+                if any(not value.is_finite() or value < 0 for value in [total, *allocated.values()]):
+                    raise ValueError('Informe valores não negativos e finitos.')
+                if sum(allocated.values()) > total:
+                    raise ValueError('As reservas não podem exceder o saldo.')
+                cleaned.append({'token': token, 'location': location, 'total': str(total),
+                                **{key: str(value) for key, value in allocated.items()},
+                                'available': str(total - sum(allocated.values()))})
+            grid_btc = Decimal(str(data.get('grid_btc', '0')))
+            if not grid_btc.is_finite() or grid_btc < 0:
+                raise ValueError('Informe o BTC do grid como valor não negativo.')
+            result = {'balances': cleaned, 'grid_btc': str(grid_btc)}
+            con.execute('INSERT OR REPLACE INTO funds VALUES (1, ?)', (json.dumps(result),))
+            return result
+        except (KeyError, TypeError, InvalidOperation) as exc:
+            raise ValueError('Dados dos saldos inválidos.') from exc
+
+
+def repay(data):
+    try:
+        identity = tuple(str(data[key]).strip() for key in ('account', 'network', 'market'))
+        token = str(data['token']).strip()
+        request_id = str(data['request_id']).strip()
+        if not request_id:
+            raise ValueError('Identificador da operação obrigatório.')
+        amount = Decimal(str(data['amount']))
+        if not amount.is_finite() or amount <= 0:
+            raise ValueError('Informe uma quantia positiva.')
+        with closing(sqlite3.connect(DB)) as con, con:
+            con.execute('BEGIN IMMEDIATE')
+            con.execute('CREATE TABLE IF NOT EXISTS repayments (request_id TEXT PRIMARY KEY, request TEXT NOT NULL, result TEXT NOT NULL)')
+            previous = con.execute('SELECT request, result FROM repayments WHERE request_id = ?', (request_id,)).fetchone()
+            signature = json.dumps({'identity': identity, 'token': token, 'amount': str(amount)}, sort_keys=True)
+            if previous:
+                if previous[0] != signature:
+                    raise ValueError('Identificador já utilizado para outra amortização.')
+                return json.loads(previous[1])
+            row = con.execute('SELECT payload FROM funds WHERE id = 1').fetchone()
+            scenario_row = con.execute('SELECT current FROM scenario_positions WHERE account = ? AND network = ? AND market = ?', identity).fetchone()
+            if not row or not scenario_row:
+                raise ValueError('Cadastre os saldos e o cenário Aave primeiro.')
+            wallet = json.loads(row[0])
+            current = json.loads(scenario_row[0])
+            balance = next((item for item in wallet['balances'] if item['token'].lower() == token.lower() and item['location'].lower() == 'rede'), None)
+            matching_debts = [item for item in current['input']['debts'] if item['token'].lower() == token.lower()]
+            debt = matching_debts[0] if len(matching_debts) == 1 else None
+            if not balance or not debt:
+                raise ValueError('A dívida e o saldo na rede devem usar a mesma stablecoin.')
+            available = Decimal(balance['available']) + Decimal(balance['reserva'])
+            if amount > available or amount > Decimal(debt['quantity']):
+                raise ValueError('Quantia excede a dívida ou o caixa disponível na rede.')
+            used_reserve = min(amount, Decimal(balance['reserva']))
+            balance['reserva'] = str(Decimal(balance['reserva']) - used_reserve)
+            balance['total'] = str(Decimal(balance['total']) - amount)
+            balance['available'] = str(Decimal(balance['available']) - (amount - used_reserve))
+            debt['quantity'] = str(Decimal(debt['quantity']) - amount)
+            current['result'] = calculate_scenario(current['input'])
+            con.execute('UPDATE funds SET payload = ? WHERE id = 1', (json.dumps(wallet),))
+            con.execute('UPDATE scenario_positions SET current = ? WHERE account = ? AND network = ? AND market = ?', (json.dumps(current), *identity))
+            result = {'funds': wallet, 'scenario': current}
+            con.execute('INSERT INTO repayments VALUES (?, ?, ?)', (request_id, signature, json.dumps(result)))
+            return result
+    except (KeyError, TypeError, InvalidOperation, sqlite3.OperationalError) as exc:
+        raise ValueError('Dados de amortização inválidos ou cenário não cadastrado.') from exc
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/api/position':
@@ -111,13 +201,15 @@ class Handler(BaseHTTPRequestHandler):
             params = parse_qs(urlsplit(self.path).query)
             identity = tuple(params.get(key, [''])[0] for key in ('account', 'network', 'market')) if params else None
             self.respond(200, json.dumps(scenario(identity=identity)).encode(), 'application/json')
+        elif self.path == '/api/funds':
+            self.respond(200, json.dumps(funds()).encode(), 'application/json')
         elif self.path == '/':
             self.respond(200, Path(__file__).with_name('index.html').read_bytes(), 'text/html; charset=utf-8')
         else:
             self.send_error(404)
 
     def do_POST(self):
-        if self.path not in ('/api/position', '/api/scenario'):
+        if self.path not in ('/api/position', '/api/scenario', '/api/funds', '/api/repay'):
             self.send_error(404)
             return
         try:
@@ -127,6 +219,10 @@ class Handler(BaseHTTPRequestHandler):
             data = json.loads(self.rfile.read(size))
             if self.path == '/api/scenario':
                 result = scenario(data, bool(data.get('snapshot')))
+            elif self.path == '/api/funds':
+                result = funds(data)
+            elif self.path == '/api/repay':
+                result = repay(data)
             else:
                 save(data)
                 result = load()

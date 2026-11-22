@@ -9,7 +9,12 @@
 <h3>Garantias</h3><div id="collateral"></div><button type="button" id="add-collateral">Adicionar garantia</button>
 <h3>Dívidas</h3><div id="debts"></div><button type="button" id="add-debt">Adicionar dívida</button>
 <div><button type="submit">Calcular cenário</button> <button type="button" id="snapshot">Salvar cenário original</button></div>
-<p id="scenario-message" role="status"></p></form><p id="scenario-current"></p><p id="scenario-original"></p></section></main>
+<p id="scenario-message" role="status"></p></form><p id="scenario-current"></p><p id="scenario-original"></p></section>
+<section class="card" style="margin-top:24px"><h2>Caixa simulado</h2>
+<form id="funds"><div id="balances"></div><button type="button" id="add-balance">Adicionar saldo</button>
+<label>BTC adicional no grid<input name="grid_btc" type="number" min="0" step="any" required value="0"></label><button>Salvar saldos</button></form>
+<p id="funds-message" role="status"></p><div id="funds-result"></div>
+<h3>Amortizar dívida na Aave</h3><form id="repay"><div class="fields"><label>Stablecoin<input name="token" required></label><label>Quantia<input name="amount" type="number" min="0.00000001" step="any" required></label></div><button>Simular amortização</button></form><p id="repay-message" role="status"></p></section></main>
 <script>
 const labels={account:'Conta',network:'Rede',market:'Mercado Aave',token:'Token de garantia',contract:'Contrato da garantia',quantity:'Quantidade da garantia',price:'Preço da garantia em USD',threshold:'Limiar de liquidação (%)',debt_token:'Stablecoin da dívida',debt_contract:'Contrato da stablecoin',debt_quantity:'Quantidade da dívida',debt_price:'Preço da stablecoin em USD',source:'Fonte dos dados',observed_at:'Data e hora da observação'};
 const numeric=['quantity','price','threshold','debt_quantity','debt_price'];
@@ -29,4 +34,13 @@ async function submitScenario(snapshot){const form=document.querySelector('#scen
 document.querySelector('#scenario').onsubmit=e=>{e.preventDefault();submitScenario(false)};
 document.querySelector('#snapshot').onclick=()=>submitScenario(true);
 fetch('/api/scenario').then(r=>r.json()).then(data=>{if(data){for(const key of ['account','network','market','btc_price'])document.querySelector('#scenario').elements[key].value=data.current.input[key];for(const kind of Object.keys(definitions))data.current.input[kind].forEach(row=>addRow(kind,row));showScenario(data)}else{addRow('collateral');addRow('debts')}});
+
+const balanceLabels={token:'Stablecoin',location:'Local (rede ou exchange)',total:'Saldo total',reserva:'Reserva para amortização',grid:'Grid',premios:'Prêmios',margem:'Margem',apostas:'Apostas'};
+function addBalance(data={}){const row=document.createElement('div');row.className='fields';for(const [key,label] of Object.entries(balanceLabels)){const item=document.createElement('label');item.textContent=label;const input=document.createElement('input');input.name=key;input.required=true;if(key!=='token'&&key!=='location'){input.type='number';input.step='any';input.min='0';input.value=data[key]||'0'}else input.value=data[key]||'';item.append(input);row.append(item)}const remove=document.createElement('button');remove.type='button';remove.textContent='Remover';remove.onclick=()=>row.remove();row.append(remove);document.querySelector('#balances').append(row)}
+document.querySelector('#add-balance').onclick=()=>addBalance();
+function showFunds(data){if(!data)return;document.querySelector('#funds-result').textContent=data.balances.map(item=>`${item.token} em ${item.location}: livre ${item.available}; comprometido ${Number(item.total)-Number(item.available)}`).join(' · ')+` · BTC adicional no grid: ${data.grid_btc}`}
+async function postData(url,data){const response=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});return [response,await response.json()]}
+document.querySelector('#funds').onsubmit=async e=>{e.preventDefault();const balances=[...document.querySelector('#balances').children].map(row=>Object.fromEntries([...row.querySelectorAll('input')].map(input=>[input.name,input.value])));const [response,data]=await postData('/api/funds',{balances,grid_btc:e.target.elements.grid_btc.value});document.querySelector('#funds-message').textContent=response.ok?'Saldos salvos.':data.error;if(response.ok)showFunds(data)};
+document.querySelector('#repay').onsubmit=async e=>{e.preventDefault();const form=document.querySelector('#scenario');const data=Object.fromEntries(new FormData(e.target));data.request_id=crypto.randomUUID();for(const key of ['account','network','market'])data[key]=form.elements[key].value;const [response,result]=await postData('/api/repay',data);document.querySelector('#repay-message').textContent=response.ok?'Amortização simulada.':result.error;if(response.ok){showFunds(result.funds);showScenario({current:result.scenario,original:null});location.reload()}};
+fetch('/api/funds').then(r=>r.json()).then(data=>{if(data){data.balances.forEach(addBalance);document.querySelector('#funds').elements.grid_btc.value=data.grid_btc;showFunds(data)}else addBalance()});
 </script></body></html>
