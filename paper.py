@@ -25,6 +25,8 @@ def open_spread(db_path, request, preview=spreads.preview):
         buy, sell, size = (str(request[key]).strip() for key in ('buy', 'sell', 'size'))
         token = str(request.get('token') or ('BTC' if venue == 'deribit' else 'USDC')).strip()
         tolerance = _d(request.get('tolerance_percent', '2'))
+        opportunity={'evaluation_id':str(request.get('evaluation_id','')).strip(),
+                     'score':str(request.get('score','')).strip()}
         proposed = _d(request['proposed_debit'])
         if not request_id or tolerance < 0 or tolerance > 100:
             raise ValueError('Identificador e tolerância entre 0 e 100% são obrigatórios.')
@@ -35,7 +37,7 @@ def open_spread(db_path, request, preview=spreads.preview):
             raise ValueError(f'A moeda do saldo deve ser {currency} para esta exchange.')
         identity = json.dumps({'venue':venue, 'direction':direction, 'entry':entry, 'buy':buy, 'sell':sell,
                                'size':size, 'token':token, 'proposed_debit':str(proposed),
-                               'tolerance_percent':str(tolerance)}, sort_keys=True)
+                               'tolerance_percent':str(tolerance),'opportunity':opportunity}, sort_keys=True)
         with closing(sqlite3.connect(db_path, timeout=10)) as con:
             con.execute('CREATE TABLE IF NOT EXISTS paper_spreads (id INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT UNIQUE NOT NULL, request TEXT NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL)')
             old = con.execute('SELECT request, payload FROM paper_spreads WHERE request_id=?', (request_id,)).fetchone()
@@ -95,7 +97,7 @@ def open_spread(db_path, request, preview=spreads.preview):
             balance['margem'] = str(_d(balance.get('margem','0')) + reserve)
             payload = {'status':'aberta', 'request_id':request_id, 'quote':quote, 'currency':currency,
                        'reserved':str(reserve), 'reserved_token':token, 'proposed_debit':str(proposed),
-                       'recotado':str(recotado), 'slippage_percent':str(slippage), 'opened_legs':[
+                       'recotado':str(recotado), 'slippage_percent':str(slippage),'opportunity':opportunity, 'opened_legs':[
                            {'instrument':buy, 'side':'buy', 'quantity':size, 'average_price':quote['buy_price']},
                            {'instrument':sell, 'side':'sell', 'quantity':size, 'average_price':quote['sell_price']}],
                        'fees':quote['fees'], 'wallet':wallet}
