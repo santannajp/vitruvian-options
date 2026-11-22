@@ -5,6 +5,7 @@ import uuid
 from contextlib import closing
 from decimal import Decimal,InvalidOperation,ROUND_DOWN
 import time
+import math
 
 import spreads
 
@@ -50,15 +51,49 @@ def _fee(venue,item,amount,price,index):
     return d(item['base_fee'])+min(d(item['rate'])*amount*index,price*amount*d(item['fee_cap']))
 
 
+def _cdf(value):
+    return (1+math.erf(value/math.sqrt(2)))/2
+
+
+def option_delta(kind,spot,strike,days,volatility_percent):
+    spot,strike,days,vol=map(float,(spot,strike,days,volatility_percent))
+    if spot<=0 or strike<=0 or vol<=0:raise ValueError('Preço, strike e volatilidade devem ser positivos para delta.')
+    t=days/365
+    if t<=0:
+        call=1.0 if spot>strike else 0.0 if spot<strike else .5
+    else:
+        sigma=vol/100
+        d1=(math.log(spot/strike)+0.5*sigma*sigma*t)/(sigma*math.sqrt(t))
+        call=_cdf(d1)
+    return call if kind=='call' else call-1
+
+
 def hedge(db_path,data,now_ms=None,universe_fetch=spreads.universe,snapshot_fetch=spreads.snapshot,index_fetch=spreads.reference_index):
     try:
         position_id=str(data['position_id']).strip();hedge_percent=d(data['hedge_percent']);budget_usd=d(data['budget_usd'])
+        event_id=str(data.get('event_id') or uuid.uuid4()).strip()
+        mode=str(data.get('selection_mode','proximity'))
+        delta_target=d(data.get('target_delta_abs','0.25'));distance_target=d(data.get('target_distance_percent','2'))
+        volatility=d(data.get('volatility_percent','60'));size_tolerance=d(data.get('size_tolerance_percent','5'))
+        renew_before=d(data.get('renewal_before_days','7'))
         now=Decimal(str(now_ms if now_ms is not None else time.time()*1000))
         with closing(sqlite3.connect(db_path)) as con:
+            try:
+                prior=con.execute('SELECT payload FROM perp_hedges WHERE event_id=?',(event_id,)).fetchone()
+            except sqlite3.OperationalError:prior=None
+            if prior:
+                existing=json.loads(prior[0])
+                request=existing.get('request',{})
+                compare={k:str(data.get(k,'')) for k in ('position_id','hedge_percent','budget_usd','selection_mode','target_delta_abs','target_distance_percent','volatility_percent','size_tolerance_percent','renewal_before_days')}
+                if request!=compare:raise ValueError('ID da renovação reutilizado com outros parâmetros.')
+                return existing
             row=con.execute('SELECT payload FROM perp_positions WHERE position_id=?',(position_id,)).fetchone()
         if not row:raise ValueError('Perpétuo simulado não encontrado.')
         position=json.loads(row[0]);venue=position['venue'];side=position['side'];horizon=d(position['horizon_days'])
-        if hedge_percent<0 or hedge_percent>100 or budget_usd<0:raise ValueError('Percentual e orçamento inválidos.')
+        if hedge_percent<0 or hedge_percent>100 or budget_usd<0 or mode not in ('proximity','delta','distance'):
+            raise ValueError('Percentual, modo e orçamento inválidos.')
+        if delta_target<0 or delta_target>1 or distance_target<0 or volatility<=0 or size_tolerance<0 or renew_before<0:
+            raise ValueError('Alvo de delta, distância, volatilidade ou tolerâncias inválidos.')
         desired=d(position['effective_btc'])*hedge_percent/100
         index=d(index_fetch(venue));target_expiry=now+horizon*DAY_MS
         instruments=universe_fetch(venue,'*')
@@ -69,7 +104,13 @@ def hedge(db_path,data,now_ms=None,universe_fetch=spreads.universe,snapshot_fetc
         eligible=[x for x in instruments if x.get('type')==option_type and d(x['expiry'])==expiry and
                   (d(x['strike'])<=index if side=='long' else d(x['strike'])>=index)]
         if not eligible:raise ValueError('Sem strike protetivo elegível ao lado do índice atual.')
-        selected=min(eligible,key=lambda x:abs(d(x['strike'])-index))
+        expiry_days=max(Decimal(0),(expiry-now)/DAY_MS)
+        def selection_metric(item):
+            strike=d(item['strike'])
+            if mode=='proximity':return abs(strike-index)
+            if mode=='distance':return abs((index-strike if side=='long' else strike-index)/index*100-distance_target)
+            return abs(d(str(abs(option_delta(option_type,index,strike,expiry_days,volatility))))-delta_target)
+        selected=min(eligible,key=selection_metric)
         quote=snapshot_fetch(venue,selected['name'])
         if now-d(quote['timestamp'])>30000:raise ValueError('Livro da opção de proteção desatualizado.')
         if not quote['asks']:raise ValueError('Sem oferta para comprar a opção de proteção.')
@@ -114,8 +155,52 @@ def hedge(db_path,data,now_ms=None,universe_fetch=spreads.universe,snapshot_fetc
                 'fee_native':str(fee),'budget_usd':str(budget_usd),'funding_pnl_usd_estimate':str(funding_pnl),
                 'funding_cycles_estimate':str(cycles),'scenarios':scenarios,
                 'status':'sem_cobertura_no_lote' if amount==0 else 'simulado',
-                'risk_note':'Hedge de opção não impede liquidação do perpétuo por margem antes da liquidação da opção. Funding, taxas e payoff são cenários estimados; moedas e especificação de cada contrato devem ser conferidas.'}
-        event_id=str(data.get('event_id') or uuid.uuid4()).strip();result['event_id']=event_id
+                'risk_note':'Hedge de opção não impede liquidação do perpétuo por margem antes da liquidação da opção. Delta usa Black-Scholes com taxa zero e IV constante informada; payoff é intrínseco estimado e não replica settlement, margem ou skew oficiais. Funding, taxas, multiplicador e moedas devem ser conferidos.'}
+        signed_delta=d(str(option_delta(option_type,index,d(quote['strike']),expiry_days,volatility)))
+        with closing(sqlite3.connect(db_path)) as con:
+            try:previous_row=con.execute('SELECT payload FROM perp_hedges WHERE position_id=? ORDER BY rowid DESC LIMIT 1',(position_id,)).fetchone()
+            except sqlite3.OperationalError:previous_row=None
+        previous=json.loads(previous_row[0]) if previous_row else None
+        renewal_reasons=[];renewal_action='inicial'
+        if previous:
+            prior_size=d(previous['position']['effective_btc']);size_change=abs(d(position['effective_btc'])-prior_size)/prior_size*100 if prior_size else Decimal(100)
+            if size_change>size_tolerance:renewal_reasons.append(f'Exposição mudou {size_change}% acima da tolerância {size_tolerance}%.')
+            if previous.get('option')!=selected['name']:renewal_reasons.append('O strike elegível mudou com o mercado ou alvo.')
+            premium_change=abs(premium_usd-d(previous['premium_usd']))/max(Decimal('0.00000001'),d(previous['premium_usd']))*100
+            if premium_change>size_tolerance:renewal_reasons.append(f'Prêmio mudou {premium_change}% acima da tolerância {size_tolerance}%.')
+            if d(previous['expiry'])-now<=renew_before*DAY_MS:renewal_reasons.append('A proteção anterior entrou na janela de renovação.')
+            if desired>d(previous['covered_btc']):renewal_reasons.append('O alvo de cobertura atual excede a cobertura anterior.')
+            renewal_action='renovar' if renewal_reasons else 'manter'
+        if amount<desired and amount>0:renewal_reasons.append('Orçamento ou profundidade cobre apenas parte do nominal desejado.')
+        if amount==0:renewal_reasons.append('Orçamento ou lote mínimo não permite cobertura nesta cotação.')
+        previous_close=None
+        if previous:
+            try:
+                prior_quote=snapshot_fetch(venue,previous['option'])
+                if now-d(prior_quote['timestamp'])>30000 or not prior_quote['bids']:
+                    raise ValueError('Livro antigo desatualizado ou sem oferta de saída.')
+                close_price,close_available=map(d,prior_quote['bids'][0]);close_amount=min(d(previous['covered_btc']),close_available)
+                close_fee=_fee(venue,prior_quote,close_amount,close_price,index) if close_amount else Decimal(0)
+                proceeds=close_price*close_amount-close_fee
+                previous_close={'available_close_btc':str(close_amount),'residual_old_coverage_btc':str(d(previous['covered_btc'])-close_amount),
+                                'proceeds_native':str(proceeds),'proceeds_usd':str(proceeds*index if venue=='deribit' else proceeds),
+                                'timestamp':prior_quote['timestamp']}
+            except (ValueError,KeyError,TypeError,InvalidOperation,OSError,TimeoutError):
+                previous_close=None
+                renewal_reasons.append('Não foi possível marcar a saída da cobertura anterior; custo líquido não disponível.')
+        renewal_cost=premium_usd-d(previous_close['proceeds_usd']) if previous_close else None
+        if previous and renewal_reasons:renewal_action='renovar'
+        request={k:str(data.get(k,'')) for k in ('position_id','hedge_percent','budget_usd','selection_mode','target_delta_abs','target_distance_percent','volatility_percent','size_tolerance_percent','renewal_before_days')}
+        result['request']=request;result['event_id']=event_id
+        result.update({'selection_mode':mode,'delta':str(signed_delta),'absolute_delta':str(abs(signed_delta)),
+                       'strike_distance_percent':str(abs(d(quote['strike'])-index)/index*100),
+                       'selection_explanation':{'proximity':'strike elegível de menor distância ao índice',
+                           'delta':f'delta absoluto mais próximo de {delta_target} pelo modelo Black-Scholes de volatilidade {volatility}%',
+                           'distance':f'distância percentual mais próxima de {distance_target}% do índice'}[mode],
+                       'previous_hedge_event_id':previous.get('event_id') if previous else None,
+                       'renewal_action':renewal_action,'renewal_reasons':renewal_reasons,
+                       'previous_close_quote':previous_close,
+                       'renewal_cost_usd_estimate':str(renewal_cost) if renewal_cost is not None else None})
         with closing(sqlite3.connect(db_path,timeout=10)) as con,con:
             con.execute('CREATE TABLE IF NOT EXISTS perp_hedges (event_id TEXT PRIMARY KEY,position_id TEXT NOT NULL,payload TEXT NOT NULL)')
             previous=con.execute('SELECT payload FROM perp_hedges WHERE event_id=?',(event_id,)).fetchone()

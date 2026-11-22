@@ -53,9 +53,33 @@ class PerpHedgeTest(unittest.TestCase):
     def test_budget_limits_coverage_and_repeated_event_is_idempotent(self):
         first=self.run_hedge('p1','100','5','event-budget')
         self.assertEqual(first['covered_btc'],'0.01')
-        second=self.run_hedge('p1','1','0','event-budget')
+        second=self.run_hedge('p1','100','5','event-budget')
         self.assertEqual(first,second)
         self.assertEqual(len(perp.hedge_history(self.db)),1)
+
+    def test_delta_and_percentage_distance_modes_explain_selection(self):
+        delta=perp.hedge(self.db,{'position_id':'p1','hedge_percent':'100','budget_usd':'1000',
+            'event_id':'delta','selection_mode':'delta','target_delta_abs':'0.25','volatility_percent':'60',
+            'size_tolerance_percent':'5','renewal_before_days':'7'},now_ms=1800000000000,
+            universe_fetch=self.universe,snapshot_fetch=self.snapshot,index_fetch=lambda venue:100000)
+        distance=perp.hedge(self.db,{'position_id':'p1','hedge_percent':'100','budget_usd':'1000',
+            'event_id':'distance','selection_mode':'distance','target_distance_percent':'1',
+            'volatility_percent':'60','size_tolerance_percent':'5','renewal_before_days':'7'},
+            now_ms=1800000000000,universe_fetch=self.universe,snapshot_fetch=self.snapshot,index_fetch=lambda venue:100000)
+        self.assertIn('delta absoluto mais próximo',delta['selection_explanation'])
+        self.assertIn('distância percentual',distance['selection_explanation'])
+        self.assertTrue(0<=float(delta['absolute_delta'])<=1)
+        self.assertEqual(distance['option'],'P99000')
+
+    def test_size_change_creates_one_idempotent_renewal(self):
+        first=self.run_hedge('p1','50','1000','first-renewal')
+        updated={**self.position,'quantity':'20'}
+        perp.save_position(self.db,updated)
+        second=self.run_hedge('p1','50','1000','second-renewal')
+        self.assertEqual(second['renewal_action'],'renovar')
+        self.assertTrue(any('Exposição mudou' in reason for reason in second['renewal_reasons']))
+        self.assertEqual(second['previous_hedge_event_id'],'first-renewal')
+        self.assertEqual(len(perp.hedge_history(self.db)),2)
 
     def test_invalid_liquidation_direction_rejected(self):
         with self.assertRaisesRegex(ValueError,'abaixo da entrada'):
