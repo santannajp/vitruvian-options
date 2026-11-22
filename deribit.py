@@ -1,5 +1,6 @@
 """Public, read-only Deribit inverse BTC option quotes."""
 import json
+import time
 from decimal import Decimal, InvalidOperation
 from urllib.parse import urlencode
 from urllib.request import urlopen
@@ -23,7 +24,7 @@ def instruments(fetch=request):
                    and x.get('is_active')), key=lambda x: (x['expiry'], Decimal(x['strike'])))
 
 
-def quote(name, size, settlement_price, fetch=request):
+def quote(name, size, settlement_price, fetch=request, now=time.time):
     try:
         amount = Decimal(str(size))
         expiry_price = Decimal(str(settlement_price))
@@ -36,6 +37,8 @@ def quote(name, size, settlement_price, fetch=request):
         if amount < minimum or amount % minimum:
             raise ValueError('A quantidade deve respeitar o lote mínimo da Deribit.')
         book = fetch('get_order_book', {'instrument_name': name, 'depth': 100})
+        if now() * 1000 - book['timestamp'] > 30000:
+            raise ValueError('Cotação da Deribit desatualizada.')
         remaining = amount
         gross = Decimal(0)
         fee = Decimal(0)
@@ -52,7 +55,7 @@ def quote(name, size, settlement_price, fetch=request):
         payoff = amount * max(strike - expiry_price, Decimal(0)) / expiry_price
         return {'instrument': name, 'strike': str(strike), 'expiry': instrument['expiration_timestamp'],
                 'min_amount': str(minimum), 'contract_size': str(instrument['contract_size']),
-                'settlement_currency': instrument['settlement_currency'], 'index_price': str(book['index_price']),
+                'settlement_currency': instrument['settlement_currency'], 'collateral': instrument['settlement_currency'], 'index_price': str(book['index_price']),
                 'mark_price': str(book['mark_price']), 'timestamp': book['timestamp'], 'taker_rate': str(rate),
                 'filled': str(amount - remaining), 'unfilled': str(remaining), 'gross_btc': str(gross),
                 'estimated_fee_btc': str(fee), 'net_btc': str(gross - fee), 'expiry_gross_btc': str(payoff),
