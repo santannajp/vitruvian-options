@@ -50,7 +50,30 @@ class HttpTest(unittest.TestCase):
                     self.assertEqual(json.load(response)['health_factor'], '2')
                 with urlopen(url + '/api/position') as response:
                     self.assertEqual(json.load(response)['token'], 'WBTC')
+                scenario = {'account': 'conta', 'network': 'ethereum', 'market': 'aave', 'btc_price': '100', 'observed_at': '2026-01-01T12:00Z', 'snapshot': True, 'collateral': [{'token': 'WBTC', 'contract': '0x123', 'quantity': '1', 'btc_ratio': '1', 'threshold': '80'}], 'debts': [{'token': 'USDC', 'contract': '0x456', 'quantity': '40', 'price': '1'}]}
+                request = Request(url + '/api/scenario', data=json.dumps(scenario).encode(), headers={'Content-Type': 'application/json'}, method='POST')
+                with urlopen(request) as response:
+                    self.assertEqual(json.load(response)['current']['result']['health_factor'], '2')
+                with urlopen(url + '/api/scenario?account=conta&network=ethereum&market=aave') as response:
+                    self.assertEqual(json.load(response)['original']['input']['account'], 'conta')
             finally:
                 server.shutdown()
                 server.server_close()
                 thread.join()
+
+class ScenarioTest(unittest.TestCase):
+    def test_multiple_assets_and_immutable_original(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(app, 'DB', Path(directory) / 'test.db'):
+            data = {'account': 'carteira', 'network': 'ethereum', 'market': 'aave', 'btc_price': '100', 'observed_at': '2026-01-01T00:00:00Z', 'collateral': [{'token': 'WBTC', 'contract': '0x1', 'quantity': '1', 'btc_ratio': '1', 'threshold': '80'}, {'token': 'cbBTC', 'contract': '0x2', 'quantity': '1', 'btc_ratio': '1', 'threshold': '80'}], 'debts': [{'token': 'USDC', 'contract': '0x3', 'quantity': '40', 'price': '1'}, {'token': 'USDT', 'contract': '0x4', 'quantity': '40', 'price': '1'}]}
+            first = app.scenario(data, True)
+            self.assertEqual(first['current']['result']['health_factor'], '2')
+            self.assertEqual(float(first['current']['result']['liquidation_btc_price']), 50)
+            data['debts'][1]['price'] = '2'
+            second = app.scenario(data)
+            self.assertEqual(second['current']['result']['health_factor'], '1.333333333333333333333333333')
+            self.assertEqual(second['original']['result']['health_factor'], '2')
+            self.assertEqual(app.scenario()['original']['input']['debts'][1]['price'], '1')
+            data['account'] = 'outra'
+            app.scenario(data)
+            self.assertEqual(app.scenario(identity=('carteira', 'ethereum', 'aave'))['current']['input']['account'], 'carteira')
+            self.assertEqual(app.scenario(identity=('outra', 'ethereum', 'aave'))['current']['input']['account'], 'outra')
