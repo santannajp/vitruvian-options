@@ -56,6 +56,10 @@ class HttpTest(unittest.TestCase):
                     self.assertEqual(json.load(response)['current']['result']['health_factor'], '2')
                 with urlopen(url + '/api/scenario?account=conta&network=ethereum&market=aave') as response:
                     self.assertEqual(json.load(response)['original']['input']['account'], 'conta')
+                simulation = {'account':'conta', 'network':'ethereum', 'market':'aave', 'collateral_contract':'0x123', 'debt_contract':'0x456', 'debt_to_cover':'20', 'bonus_percent':'5', 'cash_usd':'1', 'buy_price':'100', 'buy_capacity':'1', 'costs_btc':'0'}
+                request = Request(url + '/api/liquidation', data=json.dumps(simulation).encode(), headers={'Content-Type':'application/json'}, method='POST')
+                with urlopen(request) as response:
+                    self.assertEqual(json.load(response)['event'], 'sem_liquidacao')
             finally:
                 server.shutdown()
                 server.server_close()
@@ -100,3 +104,24 @@ class FundsTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 app.funds(wallet)
             self.assertEqual(app.funds()['balances'][0]['total'], '13')
+
+class LiquidationTest(unittest.TestCase):
+    def test_liquidation_and_safe_scenario(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(app, 'DB', Path(directory) / 'test.db'):
+            position = {'account': 'a', 'network': 'ethereum', 'market': 'aave', 'btc_price': '10000', 'observed_at': '2026-01-01T00:00Z', 'collateral': [{'token': 'WBTC', 'contract': '0x1', 'quantity': '1', 'btc_ratio': '1', 'threshold': '80'}], 'debts': [{'token': 'USDC', 'contract': '0x2', 'quantity': '9000', 'price': '1'}]}
+            app.scenario(position, True)
+            data = {'account': 'a', 'network': 'ethereum', 'market': 'aave', 'collateral_contract': '0x1', 'debt_contract': '0x2', 'debt_to_cover': '5000', 'bonus_percent': '10', 'cash_usd': '500', 'buy_price': '10000', 'buy_capacity': '1', 'costs_btc': '0.02'}
+            result = app.simulate_liquidation(data)
+            self.assertEqual(app.Decimal(result['remaining_btc']), app.Decimal('0.45'))
+            self.assertEqual(app.Decimal(result['net_options_btc']), app.Decimal('0.50'))
+            self.assertEqual(app.Decimal(result['gross_options_btc']), app.Decimal('0.52'))
+            self.assertEqual(app.Decimal(result['debt_repaid']), app.Decimal('5000'))
+            data['buy_capacity'] = '0.02'
+            shallow = app.simulate_liquidation(data)
+            self.assertEqual(app.Decimal(shallow['cash_btc']), app.Decimal('0.02'))
+            self.assertEqual(app.Decimal(shallow['unspent_cash_usd']), app.Decimal('300'))
+            self.assertEqual(app.Decimal(shallow['net_options_btc']), app.Decimal('0.53'))
+            self.assertEqual(app.scenario(identity=('a', 'ethereum', 'aave'))['current']['input']['debts'][0]['quantity'], '9000')
+            position['debts'][0]['quantity'] = '4000'
+            app.scenario(position)
+            self.assertEqual(app.simulate_liquidation(data)['event'], 'sem_liquidacao')

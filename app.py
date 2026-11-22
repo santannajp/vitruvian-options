@@ -193,6 +193,68 @@ def repay(data):
         raise ValueError('Dados de amortização inválidos ou cenário não cadastrado.') from exc
 
 
+def simulate_liquidation(data):
+    """Estimate a single Aave V3.3 liquidation using supplied reserve parameters."""
+    try:
+        identity = tuple(str(data[key]).strip() for key in ('account', 'network', 'market'))
+        stored = scenario(identity=identity)
+        if not stored:
+            raise ValueError('Cadastre o cenário Aave desta conta primeiro.')
+        position = stored['current']['input']
+        original = calculate_scenario(position)
+        hf = original['health_factor']
+        collateral = next((x for x in position['collateral'] if x['contract'].lower() == str(data['collateral_contract']).lower()), None)
+        debt = next((x for x in position['debts'] if x['contract'].lower() == str(data['debt_contract']).lower()), None)
+        if not collateral or not debt:
+            raise ValueError('Selecione contratos de garantia e dívida existentes.')
+        requested = Decimal(str(data['debt_to_cover']))
+        bonus = Decimal(str(data['bonus_percent']))
+        cash = Decimal(str(data['cash_usd']))
+        buy_price = Decimal(str(data['buy_price']))
+        buy_capacity = Decimal(str(data['buy_capacity']))
+        costs = Decimal(str(data['costs_btc']))
+        all_values = (requested, bonus, cash, buy_price, buy_capacity, costs)
+        if any(not x.is_finite() or x < 0 for x in all_values) or buy_price <= 0 or requested <= 0:
+            raise ValueError('Informe valores não negativos e preço de compra positivo.')
+        btc_price = Decimal(str(position['btc_price']))
+        collateral_price = btc_price * Decimal(str(collateral['btc_ratio']))
+        debt_price = Decimal(str(debt['price']))
+        if not collateral_price or not debt_price:
+            raise ValueError('Preços dos ativos devem ser positivos.')
+        debt_qty = Decimal(str(debt['quantity']))
+        collateral_qty = Decimal(str(collateral['quantity']))
+        total_debt = sum(Decimal(str(x['quantity'])) * Decimal(str(x['price'])) for x in position['debts'])
+        protected_btc = sum(Decimal(str(x['quantity'])) * Decimal(str(x['btc_ratio'])) for x in position['collateral'])
+        if hf is None or Decimal(hf) >= 1:
+            return {'event': 'sem_liquidacao', 'health_factor': hf, 'protected_btc': str(protected_btc), 'remaining_btc': str(protected_btc), 'debt_usd': str(total_debt)}
+        maximum = debt_qty
+        if Decimal(hf) > Decimal('0.95') and collateral_qty * collateral_price >= 2000 and debt_qty * debt_price >= 2000:
+            maximum = min(maximum, total_debt / 2 / debt_price)
+        actual = min(requested, maximum, collateral_qty * collateral_price / ((1 + bonus / 100) * debt_price))
+        taken = actual * debt_price * (1 + bonus / 100) / collateral_price
+        remaining_debt = debt_qty - actual
+        remaining_collateral = collateral_qty - taken
+        if actual < debt_qty and taken < collateral_qty and (remaining_debt * debt_price < 1000 or remaining_collateral * collateral_price < 1000):
+            raise ValueError('O cenário deixaria saldo residual abaixo do limite informado para Aave V3.3.')
+        remainder_btc = protected_btc - taken * Decimal(str(collateral['btc_ratio']))
+        cash_btc = min(cash / buy_price, buy_capacity)
+        net_needed = max(Decimal(0), protected_btc - remainder_btc - cash_btc)
+        position_after = json.loads(json.dumps(position))
+        next(x for x in position_after['collateral'] if x['contract'].lower() == collateral['contract'].lower())['quantity'] = str(remaining_collateral)
+        next(x for x in position_after['debts'] if x['contract'].lower() == debt['contract'].lower())['quantity'] = str(remaining_debt)
+        result = calculate_scenario(position_after)
+        return {'event': 'total' if total_debt - actual * debt_price == 0 else 'parcial', 'health_factor_before': hf,
+                'health_factor_after': result['health_factor'], 'protected_btc': str(protected_btc),
+                'remaining_btc': str(remainder_btc), 'collateral_taken': str(taken),
+                'bonus_percent': str(bonus), 'debt_repaid': str(actual),
+                'remaining_debt_units': str(remaining_debt), 'debt_usd': str(total_debt - actual * debt_price),
+                'cash_btc': str(cash_btc), 'net_options_btc': str(net_needed),
+                'gross_options_btc': str(net_needed + costs), 'assumed_buy_price': str(buy_price),
+                'unspent_cash_usd': str(cash - cash_btc * buy_price)}
+    except (KeyError, TypeError, InvalidOperation) as exc:
+        raise ValueError('Dados de liquidação inválidos.') from exc
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/api/position':
@@ -209,7 +271,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
-        if self.path not in ('/api/position', '/api/scenario', '/api/funds', '/api/repay'):
+        if self.path not in ('/api/position', '/api/scenario', '/api/funds', '/api/repay', '/api/liquidation'):
             self.send_error(404)
             return
         try:
@@ -223,6 +285,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = funds(data)
             elif self.path == '/api/repay':
                 result = repay(data)
+            elif self.path == '/api/liquidation':
+                result = simulate_liquidation(data)
             else:
                 save(data)
                 result = load()
