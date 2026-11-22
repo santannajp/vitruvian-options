@@ -48,8 +48,16 @@ class PaperTest(unittest.TestCase):
             self.assertEqual(app.funds()['balances'][0]['available'], '100')
         self.assertEqual(paper.list_spreads(self.db)[0]['status'], 'expirada')
 
+    def test_credit_slippage_uses_signed_debit_and_expires_smaller_credit(self):
+        request={**self.request,'request_id':'credit','entry':'credito','proposed_debit':'-1','tolerance_percent':'2'}
+        def quote(*args):
+            value=preview(*args);value.update(debit='-0.95',risk_estimate_usd='10');return value
+        result=paper.open_spread(self.db,request,quote)
+        self.assertEqual(result['status'],'expirada')
+        self.assertEqual(result['slippage_percent'],'5.00')
+
     def test_budget_and_request_id_conflicts(self):
-        request = {**self.request, 'entry':'credito','proposed_debit':'-1'}
+        request = {**self.request, 'entry':'credito','proposed_debit':'-1','tolerance_percent':'100'}
         def expensive_credit(*args):
             result = preview(*args)
             result.update(debit='-0.8', risk_estimate_usd='200')

@@ -47,7 +47,9 @@ def open_spread(db_path, request, preview=spreads.preview):
                 return json.loads(old[1])
         quote = preview(venue, direction, entry, buy, sell, size)
         recotado = _d(quote['debit'])
-        adverse = max(Decimal(0), recotado - proposed) if entry == 'debito' else max(Decimal(0), proposed - recotado)
+        # Signed net debit handles both long debits and short credits: a larger
+        # signed cost (or a smaller credit) is adverse in either direction.
+        adverse = max(Decimal(0), recotado - proposed)
         reference = abs(proposed)
         slippage = adverse / reference * 100 if reference else (Decimal(0) if adverse == 0 else Decimal('Infinity'))
         if slippage > tolerance:
