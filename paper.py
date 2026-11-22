@@ -112,4 +112,70 @@ def list_spreads(db_path):
             rows = con.execute('SELECT payload FROM paper_spreads ORDER BY id DESC').fetchall()
         except sqlite3.OperationalError:
             return []
-    return [json.loads(row[0]) for row in rows]
+    return [reconciled(db_path, item) for item in (json.loads(row[0]) for row in rows)]
+
+
+def record_fill(db_path, data):
+    """Record authoritative cumulative fill snapshots; unique events are replay-safe."""
+    try:
+        strategy = str(data['strategy_id']).strip()
+        event_id = str(data['event_id']).strip()
+        instrument = str(data['instrument']).strip()
+        observed_at = str(data['observed_at']).strip()
+        quantity, price, fee = map(_d, (data['quantity'], data['average_price'], data['fee']))
+        if not strategy or not event_id or not observed_at or quantity < 0 or price < 0 or fee < 0:
+            raise ValueError('Informe identificador, horário e quantidades não negativas.')
+        with closing(sqlite3.connect(db_path, timeout=10)) as con, con:
+            con.execute('BEGIN IMMEDIATE')
+            con.execute('CREATE TABLE IF NOT EXISTS paper_fill_events (event_id TEXT PRIMARY KEY, strategy_id TEXT NOT NULL, instrument TEXT NOT NULL, observed_at TEXT NOT NULL, quantity TEXT NOT NULL, average_price TEXT NOT NULL, fee TEXT NOT NULL, payload TEXT NOT NULL)')
+            row = con.execute('SELECT payload FROM paper_spreads WHERE request_id=?', (strategy,)).fetchone()
+            if not row:
+                raise ValueError('Posição simulada não encontrada.')
+            spread = json.loads(row[0])
+            if instrument not in (spread['quote']['buy'], spread['quote']['sell']):
+                raise ValueError('Instrumento não pertence a esta posição.')
+            if quantity > _d(spread['quote']['size']):
+                raise ValueError('Preenchimento acumulado excede a quantidade solicitada.')
+            event = {'strategy_id':strategy,'instrument':instrument,'observed_at':observed_at,
+                     'quantity':str(quantity),'average_price':str(price),'fee':str(fee)}
+            encoded = json.dumps(event, sort_keys=True)
+            old = con.execute('SELECT payload FROM paper_fill_events WHERE event_id=?', (event_id,)).fetchone()
+            if old:
+                if old[0] != encoded:
+                    raise ValueError('Identificador de preenchimento reutilizado com dados diferentes.')
+                return reconciled(db_path, spread)
+            con.execute('INSERT INTO paper_fill_events VALUES(?,?,?,?,?,?,?,?)',
+                        (event_id,strategy,instrument,observed_at,str(quantity),str(price),str(fee),encoded))
+            con.commit()
+            return reconciled(db_path, spread)
+    except (KeyError, TypeError, InvalidOperation, sqlite3.OperationalError) as exc:
+        raise ValueError('Dados do preenchimento inválidos.') from exc
+
+
+def reconciled(db_path, spread):
+    """Rebuild each leg from its newest cumulative venue snapshot after process restart."""
+    if spread.get('status') != 'aberta':
+        return spread
+    with closing(sqlite3.connect(db_path)) as con:
+        try:
+            rows = con.execute('SELECT instrument,observed_at,quantity,average_price,fee FROM paper_fill_events WHERE strategy_id=? ORDER BY observed_at DESC,event_id DESC',
+                               (spread['request_id'],)).fetchall()
+        except sqlite3.OperationalError:
+            rows = []
+    latest = {}
+    for instrument, observed_at, quantity, price, fee in rows:
+        latest.setdefault(instrument, {'instrument':instrument,'observed_at':observed_at,
+                                      'quantity':quantity,'average_price':price,'fee':fee})
+    requested = _d(spread['quote']['size'])
+    legs = []
+    for instrument, side, default_price in ((spread['quote']['buy'],'buy',spread['quote']['buy_price']),
+                                             (spread['quote']['sell'],'sell',spread['quote']['sell_price'])):
+        leg = latest.get(instrument, {'instrument':instrument,'quantity':str(requested),
+                    'average_price':default_price,'fee':spread['fees'],'observed_at':None})
+        legs.append({**leg,'side':side,'residual_quantity':str(requested-_d(leg['quantity']))})
+    spread['opened_legs'] = legs
+    spread['reconciled'] = _d(legs[0]['quantity']) == _d(legs[1]['quantity'])
+    spread['roll_blocked'] = not spread['reconciled']
+    spread['unhedged_quantity'] = str(abs(_d(legs[0]['quantity'])-_d(legs[1]['quantity'])))
+    spread['effective_fees'] = str(sum((_d(leg['fee']) for leg in legs), Decimal(0)))
+    return spread
